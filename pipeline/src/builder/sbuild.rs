@@ -1,0 +1,551 @@
+//! sbuild invocation, process management, and build log analysis.
+//!
+//! Wraps each build with `/usr/bin/time -v` for resource metrics and handles
+//! timeout / Ctrl+C cancellation via process-group isolation (`setpgid` /
+//! `killpg`) so the entire sbuild process tree is cleaned up reliably.
+//!
+//! Compiler substitution happens in two phases injected into sbuild's
+//! external-command hooks:
+//!
+//! 1. **chroot-setup-commands** (before dep installation) — installs the
+//!    target clang version.
+//! 2. **starting-build-commands** (after dep installation, before
+//!    dpkg-buildpackage) — diverts gcc/g++/cc/c++ to clang wrappers and
+//!    verifies the substitution succeeded.  If verification fails the build
+//!    is aborted so we never silently measure gcc instead of clang.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace, warn};
+
+use crate::builder::time_parser::parse_time_output;
+use crate::models::BuildStatus;
+
+// ---------------------------------------------------------------------------
+// Shell script templates — loaded at compile time from external files so they
+// can be linted with shellcheck independently.  The placeholder
+// `__CLANG_VERSION__` is substituted at runtime.
+// ---------------------------------------------------------------------------
+
+const CHROOT_SETUP_SCRIPT: &str = include_str!("scripts/chroot_setup.sh");
+const STARTING_BUILD_SCRIPT: &str = include_str!("scripts/starting_build.sh");
+
+/// Configuration for a single sbuild invocation.
+pub struct SbuildConfig {
+    pub dsc_path: PathBuf,
+    pub series: String,
+    pub clang_version: String,
+    pub timeout_seconds: u64,
+    pub verbose: bool,
+    pub run_tests: bool,
+    pub jobs: usize,
+    pub cancel_token: CancellationToken,
+}
+
+/// Outcome of a single sbuild run, before database insertion.
+pub struct SbuildResult {
+    pub status: BuildStatus,
+    pub log: String,
+    pub duration_seconds: Option<f64>,
+    pub peak_memory_mb: Option<i64>,
+    pub compiler_detected: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/// Build a single `.dsc` with sbuild, capturing output and resource metrics.
+///
+/// The build is wrapped with `/usr/bin/time -v` for wall-time and peak-RSS
+/// measurement.  Timeout and cancellation are handled in Rust (not via the
+/// `timeout(1)` command) to avoid process-hierarchy issues that caused
+/// orphaned chroot processes in earlier iterations.
+pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
+    let mut cmd = build_command(config)?;
+
+    debug!("Spawning: {:?}", cmd);
+
+    let mut child = cmd.spawn().context("Failed to spawn sbuild")?;
+    let child_pid = child.id().context("Failed to get child PID")?;
+    let pgid = Pid::from_raw(child_pid as i32);
+
+    let stdout = child.stdout.take().context("Failed to capture stdout")?;
+    let stderr = child.stderr.take().context("Failed to capture stderr")?;
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+
+    let mut log_lines: Vec<String> = Vec::new();
+    let mut time_output = String::new();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut timed_out = false;
+
+    let timeout = Duration::from_secs(config.timeout_seconds);
+
+    let read_result = tokio::time::timeout(timeout, async {
+        loop {
+            if stdout_done && stderr_done {
+                break;
+            }
+            tokio::select! {
+                _ = config.cancel_token.cancelled() => {
+                    anyhow::bail!("Interrupted by user");
+                }
+                line = stdout_lines.next_line(), if !stdout_done => {
+                    match line {
+                        Ok(Some(line)) => {
+                            if config.verbose { println!("{line}"); }
+                            trace!("{line}");
+                            log_lines.push(line);
+                        }
+                        Ok(None) => stdout_done = true,
+                        Err(e) => { debug!("stdout read error: {e}"); stdout_done = true; }
+                    }
+                }
+                line = stderr_lines.next_line(), if !stderr_done => {
+                    match line {
+                        Ok(Some(line)) => {
+                            if config.verbose { eprintln!("{line}"); }
+                            trace!(stderr = true, "{line}");
+                            if is_time_output(&line) {
+                                time_output.push_str(&line);
+                                time_output.push('\n');
+                            } else {
+                                log_lines.push(line);
+                            }
+                        }
+                        Ok(None) => stderr_done = true,
+                        Err(e) => { debug!("stderr read error: {e}"); stderr_done = true; }
+                    }
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(())) => { /* pipes closed normally */ }
+        Ok(Err(e)) => {
+            info!("Killing process group (pgid={pgid}) due to: {e}");
+            kill_process_group(pgid).await;
+            drain_pipes(&mut stdout_lines, &mut stderr_lines).await;
+            let _ = child.wait().await;
+            return Err(e);
+        }
+        Err(_elapsed) => {
+            timed_out = true;
+            info!("Build timed out after {}s, killing process group (pgid={pgid})", config.timeout_seconds);
+            kill_process_group(pgid).await;
+            drain_pipes(&mut stdout_lines, &mut stderr_lines).await;
+        }
+    }
+
+    let exit_status = child.wait().await.context("Failed to wait for sbuild")?;
+    let log = log_lines.join("\n");
+    let metrics = parse_time_output(&time_output);
+    let compiler_detected = detect_compiler_from_log(&log);
+
+    let status = if timed_out {
+        BuildStatus::Timeout
+    } else {
+        determine_status(exit_status.code(), &log, metrics.exit_status)
+    };
+
+    Ok(SbuildResult {
+        status,
+        log,
+        duration_seconds: metrics.wall_time_seconds,
+        peak_memory_mb: metrics.peak_memory_kb.map(|kb| kb / 1024),
+        compiler_detected: Some(compiler_detected),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Command construction
+// ---------------------------------------------------------------------------
+
+/// Assemble the full `Command` for `/usr/bin/time -v sbuild …`.
+///
+/// Separated from `run_sbuild` so the process-management code doesn't have
+/// to share vertical space with argument construction.
+fn build_command(config: &SbuildConfig) -> Result<Command> {
+    let dsc_dir = config.dsc_path.parent().context("Invalid .dsc path")?;
+
+    let setup_cmd = wrap_in_heredoc(
+        "clang-install.sh",
+        "CLANG_INSTALL_EOF",
+        &CHROOT_SETUP_SCRIPT.replace("__CLANG_VERSION__", &config.clang_version),
+    );
+    let starting_cmd = wrap_in_heredoc(
+        "clang-wrapper-setup.sh",
+        "CLANG_WRAPPER_EOF",
+        &STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", &config.clang_version),
+    );
+
+    let sbuild_config_file = generate_sbuild_config(config.jobs, config.run_tests)?;
+
+    // sbuild's unshare mode extracts chroots into $TMPDIR which defaults to
+    // /tmp.  On this machine /tmp is a 44 GB tmpfs — large builds exhaust it.
+    // Redirect to real disk instead.
+    let scratch_dir = PathBuf::from("/var/tmp/rebuild-builds");
+    std::fs::create_dir_all(&scratch_dir)
+        .context("Failed to create /var/tmp/rebuild-builds")?;
+
+    let mut cmd = Command::new("/usr/bin/time");
+    cmd.arg("-v")
+        .arg("sbuild")
+        .arg("--verbose")
+        .arg("--batch")
+        .arg("--chroot-mode=unshare")
+        .arg(format!("--dist={}", config.series))
+        .arg(format!("--chroot-setup-commands={setup_cmd}"))
+        .arg(format!("--starting-build-commands={starting_cmd}"))
+        .arg("--no-clean-source")
+        .arg(&config.dsc_path)
+        .current_dir(dsc_dir)
+        .env("SBUILD_CONFIG", sbuild_config_file.path())
+        .env("TMPDIR", &scratch_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Spawn in its own process group so we can `killpg` the entire tree.
+    // SAFETY: `setpgid` is async-signal-safe (POSIX.1-2017 §2.4.3), which is
+    // the only requirement for code inside `pre_exec`.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        });
+    }
+
+    // Keep the temp file alive for the lifetime of the command by leaking the
+    // handle.  The OS will clean it up when the process exits.
+    std::mem::forget(sbuild_config_file);
+
+    Ok(cmd)
+}
+
+/// Wrap a shell script body in a heredoc that writes it to a temp file inside
+/// the chroot and then executes it.  This is how sbuild external commands
+/// receive multi-line scripts.
+fn wrap_in_heredoc(filename: &str, delimiter: &str, body: &str) -> String {
+    format!(
+        "cat > /tmp/{filename} << '{delimiter}'\n\
+         {body}\n\
+         {delimiter}\n\
+         chmod +x /tmp/{filename} && /tmp/{filename}"
+    )
+}
+
+/// Generate a Perl config file that overrides the user's `~/.sbuildrc`.
+///
+/// Loaded via `SBUILD_CONFIG` which sbuild evaluates after system and user
+/// configs, so all assignments here take precedence.
+fn generate_sbuild_config(jobs: usize, run_tests: bool) -> Result<tempfile::NamedTempFile> {
+    let nocheck = if run_tests { "" } else { " nocheck" };
+
+    let mut file = tempfile::Builder::new()
+        .prefix("rebuild-sbuild-")
+        .suffix(".conf")
+        .tempfile()
+        .context("Failed to create temporary sbuild config")?;
+
+    write!(
+        file,
+        r#"# Auto-generated sbuild config for rebuild experiments.
+# Loaded via SBUILD_CONFIG after user config; all values here win.
+
+$build_environment = {{
+    'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',
+}};
+
+$external_commands = {{
+    'build-failed-commands' => [],
+    'build-deps-failed-commands' => [],
+    'chroot-update-failed-commands' => [],
+    'anything-failed-commands' => [],
+}};
+
+$purge_build_directory = 'always';
+$purge_session = 'always';
+$purge_build_deps = 'always';
+
+$run_lintian = 0;
+$clean_source = 0;
+
+1;
+"#
+    )
+    .context("Failed to write sbuild config")?;
+
+    debug!("Generated sbuild config at {:?}", file.path());
+    Ok(file)
+}
+
+// ---------------------------------------------------------------------------
+// Process management
+// ---------------------------------------------------------------------------
+
+/// Kill an entire process group: SIGTERM, wait 10 s, then SIGKILL.
+async fn kill_process_group(pgid: Pid) {
+    if let Err(e) = killpg(pgid, Signal::SIGTERM) {
+        warn!("Failed to SIGTERM process group {pgid}: {e}");
+        return;
+    }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    if killpg(pgid, Signal::SIGKILL).is_ok() {
+        debug!("Sent SIGKILL to process group {pgid}");
+    }
+}
+
+/// Drain remaining pipe data so a killed child doesn't block on a full buffer.
+async fn drain_pipes(
+    stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                r = stdout.next_line() => { if !matches!(r, Ok(Some(_))) { break; } }
+                r = stderr.next_line() => { if !matches!(r, Ok(Some(_))) { break; } }
+            }
+        }
+    })
+    .await;
+}
+
+/// Return `true` if this stderr line looks like `/usr/bin/time -v` output
+/// rather than sbuild output that should go into the build log.
+fn is_time_output(line: &str) -> bool {
+    // /usr/bin/time -v prefixes every line with a recognisable label
+    line.contains("time (seconds):")
+        || line.contains("Maximum resident set size")
+        || line.contains("Exit status:")
+        || line.contains("Elapsed (wall clock)")
+        || line.contains("Command being timed")
+        || line.contains("Percent of CPU")
+        || line.contains("Major (requiring I/O) page faults")
+        || line.contains("Minor (reclaiming a frame) page faults")
+        || line.contains("Voluntary context switches")
+        || line.contains("Involuntary context switches")
+}
+
+// ---------------------------------------------------------------------------
+// Build log analysis
+// ---------------------------------------------------------------------------
+
+/// Examine the build log for our `REBUILD:` verification markers to confirm
+/// that the clang wrapper setup succeeded and gcc actually calls clang.
+///
+/// sbuild echoes the full script source before executing it, so markers
+/// appearing inside `echo "…"` lines are skipped — only actual output lines
+/// (those starting at column 0 with the marker prefix) are considered.
+fn detect_compiler_from_log(log: &str) -> String {
+    let mut success = false;
+    let mut failed = false;
+    let mut version_line: Option<&str> = None;
+
+    for line in log.lines() {
+        let trimmed = line.trim();
+
+        // Skip lines that are part of the echoed script source
+        if trimmed.starts_with("echo ")
+            || trimmed.starts_with('"')
+            || trimmed.starts_with('\'')
+        {
+            continue;
+        }
+
+        if trimmed == "REBUILD: SUCCESS - gcc is now clang" {
+            success = true;
+        }
+        if trimmed.starts_with("REBUILD-ERROR: FAILED - gcc is NOT reporting as clang") {
+            failed = true;
+        }
+        if trimmed.starts_with("REBUILD:   gcc --version:") && trimmed.contains("clang") {
+            version_line = Some(trimmed);
+        }
+    }
+
+    if failed && !success {
+        return "ERROR: gcc wrapper setup FAILED - built with real GCC".into();
+    }
+
+    if success {
+        if let Some(vline) = version_line {
+            let version = vline
+                .split("gcc --version:")
+                .nth(1)
+                .map(str::trim)
+                .unwrap_or("clang (version unknown)");
+            return format!("clang confirmed: {version}");
+        }
+        return "clang confirmed".into();
+    }
+
+    "UNKNOWN: no compiler verification markers found in log".into()
+}
+
+/// Map sbuild exit codes and log content to a `BuildStatus`.
+fn determine_status(
+    wrapper_exit: Option<i32>,
+    log: &str,
+    time_exit: Option<i32>,
+) -> BuildStatus {
+    let exit_code = time_exit.or(wrapper_exit).unwrap_or(-1);
+
+    if log.contains("Build killed") || log.contains("Timed out") {
+        return BuildStatus::Timeout;
+    }
+
+    if log.contains("unsatisfiable build-dependencies")
+        || log.contains("build-dependency not installable")
+        || log.contains("Dependency wait")
+    {
+        return BuildStatus::DepWait;
+    }
+
+    if exit_code == 0
+        && (log.contains("Build finished successfully")
+            || log.contains("dpkg-buildpackage: info: binary-only upload")
+            || (log.contains("dpkg-deb: building package") && !log.contains("Build failure")))
+    {
+        return BuildStatus::Succeeded;
+    }
+
+    BuildStatus::Failed
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- determine_status ---------------------------------------------------
+
+    #[test]
+    fn status_success() {
+        let log = "lots of output\nBuild finished successfully\n";
+        assert_eq!(
+            determine_status(Some(0), log, Some(0)),
+            BuildStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn status_failed() {
+        let log = "error: something broke\nBuild failure\n";
+        assert_eq!(
+            determine_status(Some(1), log, Some(1)),
+            BuildStatus::Failed
+        );
+    }
+
+    #[test]
+    fn status_timeout_in_log() {
+        let log = "output\nBuild killed\n";
+        assert_eq!(
+            determine_status(Some(1), log, Some(1)),
+            BuildStatus::Timeout
+        );
+    }
+
+    #[test]
+    fn status_depwait() {
+        let log = "E: unsatisfiable build-dependencies\n";
+        assert_eq!(
+            determine_status(Some(1), log, Some(1)),
+            BuildStatus::DepWait
+        );
+    }
+
+    // -- shell script generation --------------------------------------------
+
+    #[test]
+    fn chroot_setup_substitutes_version() {
+        let script = CHROOT_SETUP_SCRIPT.replace("__CLANG_VERSION__", "19");
+        assert!(script.contains(r#"CLANG_VERSION="19""#));
+        assert!(!script.contains("__CLANG_VERSION__"));
+    }
+
+    #[test]
+    fn starting_build_substitutes_version() {
+        let script = STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", "19");
+        assert!(script.contains(r#"CLANG_VERSION="19""#));
+        assert!(!script.contains("__CLANG_VERSION__"));
+    }
+
+    #[test]
+    fn starting_build_contains_verification_markers() {
+        assert!(STARTING_BUILD_SCRIPT.contains("REBUILD: SUCCESS"));
+        assert!(STARTING_BUILD_SCRIPT.contains("REBUILD-ERROR: FAILED"));
+    }
+
+    #[test]
+    fn heredoc_wraps_script() {
+        let cmd = wrap_in_heredoc("test.sh", "EOF", "echo hello");
+        assert!(cmd.starts_with("cat > /tmp/test.sh << 'EOF'"));
+        assert!(cmd.contains("echo hello"));
+        assert!(cmd.ends_with("chmod +x /tmp/test.sh && /tmp/test.sh"));
+    }
+
+    // -- detect_compiler_from_log -------------------------------------------
+
+    #[test]
+    fn detects_clang_confirmed() {
+        let log = "REBUILD:   gcc --version: Ubuntu clang version 18.1.3\n\
+                   REBUILD: SUCCESS - gcc is now clang\n";
+        let result = detect_compiler_from_log(log);
+        assert!(result.starts_with("clang confirmed"), "got: {result}");
+        assert!(result.contains("18.1.3"), "got: {result}");
+    }
+
+    #[test]
+    fn detects_wrapper_failure() {
+        let log = "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n";
+        assert!(detect_compiler_from_log(log).contains("ERROR"));
+    }
+
+    #[test]
+    fn detects_missing_markers() {
+        assert!(detect_compiler_from_log("some build output\n").contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn ignores_echoed_script_source() {
+        let log = concat!(
+            "    echo \"REBUILD: SUCCESS - gcc is now clang\"\n",
+            "    echo \"REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\" >&2\n",
+            "REBUILD: SUCCESS - gcc is now clang\n",
+        );
+        let result = detect_compiler_from_log(log);
+        assert!(result.contains("clang confirmed"), "got: {result}");
+    }
+
+    #[test]
+    fn real_failure_not_masked_by_echoed_success() {
+        let log = concat!(
+            "    echo \"REBUILD: SUCCESS - gcc is now clang\"\n",
+            "    echo \"REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\" >&2\n",
+            "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n",
+        );
+        let result = detect_compiler_from_log(log);
+        assert!(result.contains("ERROR"), "got: {result}");
+    }
+}

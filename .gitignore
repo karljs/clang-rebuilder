@@ -1,0 +1,18 @@
+# Build artifacts
+pipeline/target/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Exported data (generated, may contain personal paths in logs)
+viewer/data/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

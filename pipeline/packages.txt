@@ -1,0 +1,176 @@
+# Rebuild Experiments Test Package List
+# ~100 packages for Clang 18 testing
+# Mix of expected successes and known failures from clang.debian.net
+
+# ============================================
+# EXPECTED TO SUCCEED - Small/Fast (baseline)
+# ============================================
+hello
+sed
+grep
+tree
+less
+file
+findutils
+diffutils
+patch
+attr
+acl
+time
+hostname
+ed
+bc
+units
+
+# ============================================
+# EXPECTED TO SUCCEED - Core Utilities
+# ============================================
+coreutils
+util-linux
+procps
+psmisc
+lsof
+strace
+tar
+gzip
+cpio
+zip
+unzip
+screen
+tmux
+htop
+
+# ============================================
+# EXPECTED TO SUCCEED - Text Processing
+# ============================================
+gawk
+mawk
+m4
+flex
+bison
+groff
+texinfo
+
+# ============================================
+# EXPECTED TO SUCCEED - Compression
+# ============================================
+zlib
+bzip2
+xz-utils
+lz4
+zstd
+
+# ============================================
+# EXPECTED TO SUCCEED - Core Libraries
+# ============================================
+libffi
+pcre2
+gmp
+readline
+ncurses
+expat
+libxml2
+libxslt
+json-c
+jansson
+libyaml
+libevent
+sqlite3
+
+# ============================================
+# EXPECTED TO SUCCEED - Crypto/Security
+# ============================================
+openssl
+libassuan
+libksba
+gnupg2
+pinentry
+
+# ============================================
+# EXPECTED TO SUCCEED - Networking
+# ============================================
+curl
+wget
+rsync
+openssh
+iproute2
+iptables
+nftables
+tcpdump
+ethtool
+iw
+bridge-utils
+socat
+netcat-openbsd
+
+# ============================================
+# EXPECTED TO SUCCEED - Graphics/Fonts
+# ============================================
+freetype
+fontconfig
+harfbuzz
+pixman
+cairo
+libdrm
+libxkbcommon
+
+# ============================================
+# EXPECTED TO SUCCEED - Build Tools
+# ============================================
+make-dfsg
+cmake
+autoconf
+automake
+libtool
+gettext
+pkgconf
+
+# ============================================
+# EXPECTED TO SUCCEED - System Utilities
+# ============================================
+kmod
+dmidecode
+pciutils
+usbutils
+lshw
+hdparm
+smartmontools
+sysstat
+cryptsetup
+lvm2
+mdadm
+parted
+gdisk
+dosfstools
+ntfs-3g
+exfatprogs
+
+# ============================================
+# EXPECTED TO FAIL - Nested Functions (MAIN)
+# GCC extension not supported by Clang
+# ============================================
+bluez
+ppp
+bogl
+
+# ============================================
+# EXPECTED TO FAIL - Undefined Reference (MAIN)
+# Inline function / C99 vs GNU89 issues
+# ============================================
+gdbm
+recode
+
+# ============================================
+# EXPECTED TO FAIL - C++11 Narrowing (MAIN)
+# ============================================
+clucene-core
+
+# ============================================
+# EXPECTED TO FAIL - Various (UNIVERSE)
+# ============================================
+zvbi
+nullmailer
+audiofile
+barcode
+chipmunk
+integrit

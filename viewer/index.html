@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rebuild Experiments</title>
+    <link rel="stylesheet" href="style.css?v=2">
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <h1>Rebuild Experiments</h1>
+            <div class="dropdown" id="batch-select-dd">
+                <button class="dropdown-toggle" type="button">Loading...</button>
+                <ul class="dropdown-menu"></ul>
+            </div>
+            <button id="compare-btn" class="btn">Compare</button>
+        </div>
+        <div id="batch-info" class="header-right"></div>
+    </header>
+
+    <!-- Single batch view -->
+    <div id="single-view">
+        <div id="status-bar" class="status-bar"></div>
+
+        <div class="content-columns">
+            <section class="col-main">
+                <div class="section-header">
+                    <h2>Builds</h2>
+                    <div class="table-controls">
+                        <input type="text" id="filter-input" placeholder="Filter packages...">
+                        <div class="dropdown" id="status-filter-dd">
+                            <button class="dropdown-toggle" type="button">All</button>
+                            <ul class="dropdown-menu">
+                                <li data-value="">All</li>
+                                <li data-value="succeeded">Succeeded</li>
+                                <li data-value="failed">Failed</li>
+                                <li data-value="timeout">Timeout</li>
+                                <li data-value="dep_wait">Dep-wait</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                <table id="builds-table">
+                    <thead>
+                        <tr>
+                            <th data-sort="package">Package</th>
+                            <th data-sort="status">Status</th>
+                            <th data-sort="duration" class="num">Duration</th>
+                            <th data-sort="memory" class="num">Memory</th>
+                            <th data-sort="findings" class="num" title="Build issues detected (failed builds may show 0 if the build crashed before analysis)">Issues</th>
+                            <th class="actions-col">Log</th>
+                        </tr>
+                    </thead>
+                    <tbody id="builds-tbody"></tbody>
+                </table>
+            </section>
+
+            <aside class="col-side">
+                <h2>Issue Categories</h2>
+                <div id="findings-content">
+                    <p class="muted">No data loaded.</p>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <!-- Compare view -->
+    <div id="compare-view" class="hidden">
+        <div class="compare-header">
+            <label>A: <div class="dropdown" id="compare-batch-a-dd"><button class="dropdown-toggle" type="button">--</button><ul class="dropdown-menu"></ul></div></label>
+            <label>B: <div class="dropdown" id="compare-batch-b-dd"><button class="dropdown-toggle" type="button">--</button><ul class="dropdown-menu"></ul></div></label>
+            <button id="run-compare" class="btn btn-primary">Compare</button>
+            <button id="exit-compare" class="btn">Back</button>
+        </div>
+        <div id="compare-content"></div>
+    </div>
+
+    <!-- Build details modal -->
+    <div id="modal" class="modal hidden">
+        <div class="modal-panel">
+            <div class="modal-header">
+                <h3 id="modal-title">Build Details</h3>
+                <button id="modal-close" class="btn-close">&times;</button>
+            </div>
+            <div id="modal-body" class="modal-body"></div>
+        </div>
+    </div>
+
+    <!-- Log viewer (full viewport) -->
+    <div id="log-modal" class="modal hidden">
+        <div class="modal-panel modal-full">
+            <div class="modal-header">
+                <h3 id="log-modal-title">Build Log</h3>
+                <div class="log-controls">
+                    <input type="text" id="log-search" placeholder="Search log...">
+                    <span id="log-search-count"></span>
+                </div>
+                <button id="log-modal-close" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body modal-body-log">
+                <div id="log-content" class="log-viewer"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js?v=3"></script>
+</body>
+</html>

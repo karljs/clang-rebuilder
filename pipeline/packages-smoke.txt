@@ -1,0 +1,4 @@
+# Smoke test package list - small, fast builds for end-to-end testing
+hello
+patch
+bc

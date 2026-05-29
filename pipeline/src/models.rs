@@ -1,0 +1,152 @@
+//! Core data models for rebuild experiments.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Outcome of a package build attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildStatus {
+    Pending,
+    Building,
+    Succeeded,
+    Failed,
+    DepWait,
+    Timeout,
+}
+
+impl BuildStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Building => "building",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::DepWait => "dep_wait",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout)
+    }
+}
+
+impl std::str::FromStr for BuildStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "building" => Ok(Self::Building),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "dep_wait" => Ok(Self::DepWait),
+            "timeout" => Ok(Self::Timeout),
+            other => Err(format!("unknown build status: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for BuildStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How builds were executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuilderBackend {
+    Sbuild,
+    Launchpad,
+    External,
+}
+
+impl BuilderBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sbuild => "sbuild",
+            Self::Launchpad => "launchpad",
+            Self::External => "external",
+        }
+    }
+}
+
+impl std::str::FromStr for BuilderBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "sbuild" => Ok(Self::Sbuild),
+            "launchpad" => Ok(Self::Launchpad),
+            "external" => Ok(Self::External),
+            other => Err(format!("unknown builder backend: {other}")),
+        }
+    }
+}
+
+/// A batch is a collection of builds for a specific clang version + series.
+/// Each `build` invocation creates a new batch automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Batch {
+    pub id: Uuid,
+    pub name: String,
+    pub clang_version: String,
+    pub series: String,
+    pub builder_backend: BuilderBackend,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// A single package build attempt, as stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Build {
+    pub id: Uuid,
+    pub batch_id: Uuid,
+    pub source_package: String,
+    pub version: String,
+    pub status: BuildStatus,
+    pub build_duration_seconds: Option<f64>,
+    pub peak_memory_mb: Option<i64>,
+    pub disk_usage_mb: Option<i64>,
+    pub build_log: Option<String>,
+    pub compiler_detected: Option<String>,
+    pub submitted_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// An error finding from build-log analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildFinding {
+    pub id: Uuid,
+    pub build_id: Uuid,
+    pub category: String,
+    pub description: String,
+    pub excerpt: String,
+    pub line_number: Option<i64>,
+}
+
+/// Result from running a single build (before database insertion).
+#[derive(Debug, Clone)]
+pub struct BuildResult {
+    pub source_package: String,
+    pub version: String,
+    pub status: BuildStatus,
+    pub build_duration_seconds: Option<f64>,
+    pub peak_memory_mb: Option<i64>,
+    pub disk_usage_mb: Option<i64>,
+    pub build_log: String,
+    pub compiler_detected: Option<String>,
+}
+
+/// Resource usage metrics parsed from `/usr/bin/time -v` output.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceMetrics {
+    pub wall_time_seconds: Option<f64>,
+    pub user_time_seconds: Option<f64>,
+    pub system_time_seconds: Option<f64>,
+    pub peak_memory_kb: Option<i64>,
+    pub exit_status: Option<i32>,
+}
