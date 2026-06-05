@@ -1,7 +1,9 @@
 // Rebuild Experiments Report Viewer
 
 const DATA_BASE_URL = './data';
+const SQL_JS_CDN = 'https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/';
 
+let sqlDb = null;
 let batches = [];
 let currentBatch = null;
 let currentBatchData = null;
@@ -9,6 +11,17 @@ let sortColumn = 'package';
 let sortDirection = 'asc';
 
 function el(id) { return document.getElementById(id); }
+
+// ── SQL helper ──
+
+function dbQuery(sql, params) {
+    var stmt = sqlDb.prepare(sql);
+    if (params) stmt.bind(params);
+    var rows = [];
+    while (stmt.step()) rows.push(stmt.getAsObject());
+    stmt.free();
+    return rows;
+}
 
 // ── Custom dropdown helpers ──
 
@@ -20,7 +33,6 @@ function initDropdown(containerId, onChange) {
 
     toggle.addEventListener('click', function(e) {
         e.stopPropagation();
-        // Close all other dropdowns first
         document.querySelectorAll('.dropdown.open').forEach(function(d) {
             if (d !== dd) d.classList.remove('open');
         });
@@ -61,7 +73,6 @@ function getDropdownValue(containerId) {
     return dd ? (dd.dataset.value || '') : '';
 }
 
-// Close dropdowns when clicking outside
 document.addEventListener('click', function() {
     document.querySelectorAll('.dropdown.open').forEach(function(d) {
         d.classList.remove('open');
@@ -78,48 +89,137 @@ if (document.readyState === 'loading') {
 
 async function init() {
     try {
-        await loadBatches();
+        var SQL = await initSqlJs({ locateFile: function(f) { return SQL_JS_CDN + f; } });
+        var buf = await fetch(DATA_BASE_URL + '/rebuild.db').then(function(r) {
+            if (!r.ok) throw new Error('rebuild.db not found — run: rebuild-pipeline export');
+            return r.arrayBuffer();
+        });
+        sqlDb = new SQL.Database(new Uint8Array(buf));
+
+        var overlay = el('loading-overlay');
+        if (overlay) overlay.classList.add('hidden');
+
+        loadBatches();
         setupEventListeners();
-        if (batches.length > 0) await selectBatch(batches[0].id);
+        if (batches.length > 0) selectBatch(batches[0].id);
     } catch (err) {
         console.error('Init failed:', err);
-        var sb = el('status-bar');
-        if (sb) sb.textContent = 'Init failed: ' + err.message;
+        var overlay = el('loading-overlay');
+        if (overlay) overlay.innerHTML = '<p class="load-error">Failed to load database: ' + escapeHtml(String(err.message || err)) + '</p>';
     }
 }
 
-async function loadBatches() {
-    const r = await fetch(DATA_BASE_URL + '/index.json');
-    if (!r.ok) throw new Error('No index.json');
-    batches = await r.json();
+// ── Data loading ──
 
-    // Populate batch-select dropdown
+function loadBatches() {
+    var batchRows = dbQuery(
+        "SELECT id, name, compiler_type, compiler_version, series, profile_name, started_at, finished_at " +
+        "FROM batches ORDER BY started_at DESC"
+    );
+
+    // All batch stats in one query instead of one per batch.
+    var statRows = dbQuery(
+        "SELECT batch_id, status, COUNT(*) AS count FROM builds GROUP BY batch_id, status"
+    );
+    var statsMap = {};
+    for (var i = 0; i < statRows.length; i++) {
+        var r = statRows[i];
+        if (!statsMap[r.batch_id]) {
+            statsMap[r.batch_id] = { total: 0, succeeded: 0, failed: 0, dep_wait: 0, timeout: 0 };
+        }
+        var s = statsMap[r.batch_id];
+        var count = Number(r.count);
+        s.total += count;
+        if (r.status === 'succeeded') s.succeeded = count;
+        else if (r.status === 'failed') s.failed = count;
+        else if (r.status === 'dep_wait') s.dep_wait = count;
+        else if (r.status === 'timeout') s.timeout = count;
+    }
+
+    batches = batchRows.map(function(row) {
+        return {
+            id: row.id,
+            name: row.name,
+            compiler_type: row.compiler_type,
+            compiler_version: row.compiler_version,
+            series: row.series,
+            profile_name: row.profile_name,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            stats: statsMap[row.id] || { total: 0, succeeded: 0, failed: 0, dep_wait: 0, timeout: 0 }
+        };
+    });
+
     setDropdownOptions('batch-select-dd', batches.map(function(b) {
         return { value: b.id, label: b.name + ' (' + b.stats.succeeded + '/' + b.stats.total + ')' };
     }));
-
-    // Populate compare dropdowns
-    var compareOpts = batches.map(function(b) {
-        return { value: b.id, label: b.name };
-    });
+    var compareOpts = batches.map(function(b) { return { value: b.id, label: b.name }; });
     setDropdownOptions('compare-batch-a-dd', compareOpts);
     setDropdownOptions('compare-batch-b-dd', compareOpts);
 }
 
+function loadBatchData(batchId) {
+    var buildRows = dbQuery(
+        "SELECT id, source_package AS package, version, status, " +
+        "build_duration_seconds AS duration_seconds, peak_memory_mb " +
+        "FROM builds WHERE batch_id = ? ORDER BY source_package",
+        [batchId]
+    );
+
+    // Finding counts for all builds in this batch in one query.
+    var countRows = dbQuery(
+        "SELECT build_id, COUNT(*) AS count FROM build_findings " +
+        "WHERE build_id IN (SELECT id FROM builds WHERE batch_id = ?) " +
+        "GROUP BY build_id",
+        [batchId]
+    );
+    var countMap = {};
+    for (var i = 0; i < countRows.length; i++) {
+        countMap[countRows[i].build_id] = Number(countRows[i].count);
+    }
+
+    var summaryRows = dbQuery(
+        "SELECT bf.category, COUNT(*) AS count " +
+        "FROM build_findings bf JOIN builds b ON bf.build_id = b.id " +
+        "WHERE b.batch_id = ? GROUP BY bf.category ORDER BY count DESC",
+        [batchId]
+    );
+
+    return {
+        builds: buildRows.map(function(row) {
+            return {
+                id: row.id,
+                package: row.package,
+                version: row.version,
+                status: row.status,
+                duration_seconds: row.duration_seconds,
+                peak_memory_mb: row.peak_memory_mb,
+                finding_count: countMap[row.id] || 0
+            };
+        }),
+        finding_summary: summaryRows.map(function(row) {
+            return { category: row.category, count: Number(row.count) };
+        })
+    };
+}
+
+function selectBatch(batchId) {
+    currentBatch = batches.find(function(b) { return b.id === batchId; });
+    if (!currentBatch) return;
+    currentBatchData = loadBatchData(batchId);
+    renderStatusBar();
+    renderFindings();
+    renderBuildsTable();
+}
+
+// ── Event listeners ──
+
 function setupEventListeners() {
-    // Custom dropdown handlers
-    initDropdown('batch-select-dd', function(val) {
-        selectBatch(val);
-    });
-
-    initDropdown('status-filter-dd', function() {
-        renderBuildsTable();
-    });
-
+    initDropdown('batch-select-dd', function(val) { selectBatch(val); });
+    initDropdown('status-filter-dd', function() { renderBuildsTable(); });
     initDropdown('compare-batch-a-dd');
     initDropdown('compare-batch-b-dd');
 
-    // Compare buttons
     var cb = el('compare-btn');
     if (cb) cb.addEventListener('click', function() {
         el('single-view').classList.add('hidden');
@@ -135,41 +235,32 @@ function setupEventListeners() {
     var rc = el('run-compare');
     if (rc) rc.addEventListener('click', runComparison);
 
-    // Filter input
     var fi = el('filter-input');
     if (fi) fi.addEventListener('input', renderBuildsTable);
 
-    // Modal close buttons
     var mc = el('modal-close');
     if (mc) mc.addEventListener('click', closeModal);
-
     var lmc = el('log-modal-close');
     if (lmc) lmc.addEventListener('click', closeLogModal);
 
-    // Click backdrop to close
     var m = el('modal');
     if (m) m.addEventListener('click', function(e) { if (e.target === this) closeModal(); });
-
     var lm = el('log-modal');
     if (lm) lm.addEventListener('click', function(e) { if (e.target === this) closeLogModal(); });
 
-    // Sort headers
     document.querySelectorAll('th[data-sort]').forEach(function(th) {
         th.addEventListener('click', function() { handleSort(this.dataset.sort); });
     });
 
-    // Log search
     var ls = el('log-search');
     if (ls) ls.addEventListener('input', handleLogSearch);
 
-    // Keyboard: Escape to close modals, Backspace as back
     document.addEventListener('keydown', function(e) {
         if (e.key === 'Escape') {
             var logModal = el('log-modal');
             var modal = el('modal');
             if (logModal && !logModal.classList.contains('hidden')) { closeLogModal(); return; }
             if (modal && !modal.classList.contains('hidden')) { closeModal(); return; }
-            // Close compare view
             var cv = el('compare-view');
             if (cv && !cv.classList.contains('hidden')) {
                 cv.classList.add('hidden');
@@ -178,8 +269,6 @@ function setupEventListeners() {
         }
     });
 }
-
-// ── Modal open/close with back button support ──
 
 function closeModal() {
     var m = el('modal');
@@ -191,26 +280,7 @@ function closeLogModal() {
     if (lm) lm.classList.add('hidden');
 }
 
-// ── Data loading ──
-
-async function selectBatch(batchId) {
-    currentBatch = batches.find(function(b) { return b.id === batchId; });
-    if (!currentBatch) return;
-
-    try {
-        const r = await fetch(DATA_BASE_URL + '/batches/' + batchId + '.json');
-        if (!r.ok) throw new Error('Failed to load batch');
-        currentBatchData = await r.json();
-
-        renderStatusBar();
-        renderFindings();
-        renderBuildsTable();
-    } catch (err) {
-        console.error('Batch load failed:', err);
-        var sb = el('status-bar');
-        if (sb) sb.textContent = 'Failed to load batch data.';
-    }
-}
+// ── Render ──
 
 function renderStatusBar() {
     var b = currentBatch;
@@ -219,12 +289,9 @@ function renderStatusBar() {
     var started = new Date(b.started_at).toLocaleString();
 
     var totalSecs = 0;
-    var unanalyzed = 0;
     if (currentBatchData && currentBatchData.builds) {
         for (var i = 0; i < currentBatchData.builds.length; i++) {
-            var build = currentBatchData.builds[i];
-            totalSecs += build.duration_seconds || 0;
-            if (build.status !== 'succeeded' && !build.finding_count) unanalyzed++;
+            totalSecs += currentBatchData.builds[i].duration_seconds || 0;
         }
     }
 
@@ -239,7 +306,7 @@ function renderStatusBar() {
         '<span>' + fmtDuration(totalSecs) + ' total build time</span>';
 
     var bi = el('batch-info');
-    if (bi) bi.textContent = b.clang_version + ' \u00b7 ' + b.series + ' \u00b7 ' + started;
+    if (bi) bi.textContent = b.compiler_type + ' ' + b.compiler_version + ' \u00b7 ' + b.series + ' \u00b7 ' + started;
 }
 
 function renderFindings() {
@@ -248,7 +315,6 @@ function renderFindings() {
 
     var findings = (currentBatchData && currentBatchData.finding_summary) || [];
 
-    // Count builds that didn't complete and have no issue data
     var unanalyzed = 0;
     if (currentBatchData && currentBatchData.builds) {
         for (var i = 0; i < currentBatchData.builds.length; i++) {
@@ -261,8 +327,6 @@ function renderFindings() {
         fc.innerHTML = '<p class="muted">No issues in this batch.</p>';
         return;
     }
-
-    findings.sort(function(a, b) { return b.count - a.count; });
 
     var total = 0;
     for (var i = 0; i < findings.length; i++) total += findings[i].count;
@@ -313,12 +377,12 @@ function renderBuildsTable() {
     builds.sort(function(a, b) {
         var av, bv;
         switch (sortColumn) {
-            case 'package': av = a.package; bv = b.package; break;
-            case 'status': av = a.status; bv = b.status; break;
+            case 'package':  av = a.package;           bv = b.package;           break;
+            case 'status':   av = a.status;            bv = b.status;            break;
             case 'duration': av = a.duration_seconds || 0; bv = b.duration_seconds || 0; break;
-            case 'memory': av = a.peak_memory_mb || 0; bv = b.peak_memory_mb || 0; break;
-            case 'findings': av = a.finding_count || 0; bv = b.finding_count || 0; break;
-            default: av = a.package; bv = b.package;
+            case 'memory':   av = a.peak_memory_mb || 0;   bv = b.peak_memory_mb || 0;   break;
+            case 'findings': av = a.finding_count || 0;    bv = b.finding_count || 0;    break;
+            default:         av = a.package;           bv = b.package;
         }
         if (typeof av === 'string') {
             return sortDirection === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
@@ -351,7 +415,6 @@ function renderBuildsTable() {
     tbody.innerHTML = html;
 }
 
-// Use event delegation for table action buttons
 document.addEventListener('click', function(e) {
     if (e.target.closest('.dropdown')) return;
     var btn = e.target.closest('[data-action]');
@@ -384,46 +447,50 @@ function fmtDuration(s) {
 
 function escapeHtml(text) {
     var d = document.createElement('div');
-    d.textContent = text;
+    d.textContent = String(text);
     return d.innerHTML;
 }
 
 function escapeAttr(text) {
-    return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;');
+    return String(text).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;');
 }
 
 // ── Build details modal ──
 
-async function showBuildDetails(buildId) {
-    try {
-        var r = await fetch(DATA_BASE_URL + '/builds/' + buildId + '.json');
-        if (!r.ok) throw new Error('Failed');
-        var build = await r.json();
+function showBuildDetails(buildId) {
+    var findings = dbQuery(
+        "SELECT category, description, excerpt, line_number " +
+        "FROM build_findings WHERE build_id = ? ORDER BY line_number",
+        [buildId]
+    );
 
-        var mt = el('modal-title');
-        var mb = el('modal-body');
-        if (mt) mt.textContent = build.package + ' \u2014 Findings';
-
-        if (!build.findings || build.findings.length === 0) {
-            if (mb) mb.innerHTML = '<p class="muted">No findings.</p>';
-        } else {
-            var html = '';
-            for (var i = 0; i < build.findings.length; i++) {
-                var f = build.findings[i];
-                html += '<div class="finding-detail">' +
-                    '<h4>' + escapeHtml(f.category) + '</h4>' +
-                    '<p>' + escapeHtml(f.description) + '</p>' +
-                    (f.line_number ? '<p class="muted">Line ' + f.line_number + '</p>' : '') +
-                    '<pre>' + escapeHtml(f.excerpt) + '</pre>' +
-                    '</div>';
-            }
-            if (mb) mb.innerHTML = html;
-        }
-        var m = el('modal');
-        if (m) m.classList.remove('hidden');
-    } catch (err) {
-        console.error('Details load failed:', err);
+    var packageName = '';
+    if (currentBatchData) {
+        var build = currentBatchData.builds.find(function(b) { return b.id === buildId; });
+        if (build) packageName = build.package;
     }
+
+    var mt = el('modal-title');
+    var mb = el('modal-body');
+    if (mt) mt.textContent = packageName + ' \u2014 Findings';
+
+    if (findings.length === 0) {
+        if (mb) mb.innerHTML = '<p class="muted">No findings.</p>';
+    } else {
+        var html = '';
+        for (var i = 0; i < findings.length; i++) {
+            var f = findings[i];
+            html += '<div class="finding-detail">' +
+                '<h4>' + escapeHtml(f.category) + '</h4>' +
+                '<p>' + escapeHtml(f.description) + '</p>' +
+                (f.line_number ? '<p class="muted">Line ' + f.line_number + '</p>' : '') +
+                '<pre>' + escapeHtml(f.excerpt) + '</pre>' +
+                '</div>';
+        }
+        if (mb) mb.innerHTML = html;
+    }
+    var m = el('modal');
+    if (m) m.classList.remove('hidden');
 }
 
 // ── Log viewer ──
@@ -433,7 +500,7 @@ var currentLogText = '';
 async function showBuildLog(buildId, packageName) {
     try {
         var r = await fetch(DATA_BASE_URL + '/logs/' + buildId + '.log');
-        if (!r.ok) throw new Error('Failed');
+        if (!r.ok) throw new Error('Log not found');
         currentLogText = await r.text();
 
         var lt = el('log-modal-title');
@@ -445,7 +512,6 @@ async function showBuildLog(buildId, packageName) {
         renderLog(currentLogText);
         var lm = el('log-modal');
         if (lm) lm.classList.remove('hidden');
-
         setTimeout(function() { if (ls) ls.focus(); }, 100);
     } catch (err) {
         console.error('Log load failed:', err);
@@ -502,20 +568,22 @@ function escapeRegex(s) {
 
 // ── Compare ──
 
-async function runComparison() {
+function runComparison() {
     var aId = getDropdownValue('compare-batch-a-dd');
     var bId = getDropdownValue('compare-batch-b-dd');
     if (aId === bId) { alert('Select two different batches.'); return; }
 
-    try {
-        var responses = await Promise.all([
-            fetch(DATA_BASE_URL + '/batches/' + aId + '.json').then(function(r) { return r.json(); }),
-            fetch(DATA_BASE_URL + '/batches/' + bId + '.json').then(function(r) { return r.json(); })
-        ]);
-        renderComparison(responses[0], responses[1]);
-    } catch (err) {
-        console.error('Compare failed:', err);
-    }
+    var batchA = batches.find(function(b) { return b.id === aId; });
+    var batchB = batches.find(function(b) { return b.id === bId; });
+    if (!batchA || !batchB) return;
+
+    var dataA = loadBatchData(aId);
+    var dataB = loadBatchData(bId);
+
+    renderComparison(
+        Object.assign({}, batchA, dataA),
+        Object.assign({}, batchB, dataB)
+    );
 }
 
 function renderComparison(a, b) {

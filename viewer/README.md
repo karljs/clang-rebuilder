@@ -1,6 +1,6 @@
 # Rebuild Experiments — Viewer
 
-Static HTML/JS UI for browsing rebuild results.
+Static HTML/JS UI for browsing rebuild results. Uses [sql.js](https://sql.js.org/) to query a stripped SQLite database directly in the browser.
 
 ## Setup
 
@@ -14,15 +14,17 @@ python3 -m http.server 8000 --directory ../viewer
 # Open http://localhost:8000
 ```
 
+The viewer loads `data/rebuild.db` over HTTP and queries it entirely in the browser via WebAssembly. No server-side API is needed.
+
 ## Data layout
 
 ```
 data/
-├── index.json          — batch list with summary stats
-├── batches/<id>.json   — per-batch build list and finding summary
-├── builds/<id>.json    — per-build metadata and findings
-└── logs/<id>.log       — full build log (loaded on demand)
+├── rebuild.db          — all batches, builds, and findings (build logs stripped)
+└── logs/<id>.log       — one file per build with a non-null log (fetched on demand)
 ```
+
+The database is produced by `rebuild-pipeline export`. Build logs are stored separately to keep the database file small enough for the browser to load (~2–5 MB per 1000-package batch).
 
 ## Features
 

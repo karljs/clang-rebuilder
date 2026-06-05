@@ -68,11 +68,12 @@ enum Commands {
 
     /// Export data for the report viewer.
     Export {
-        /// Output directory for exported JSON / logs.
+        /// Output directory for the export (receives rebuild.db and logs/).
         #[arg(long)]
         output_dir: PathBuf,
 
-        /// Export only a specific batch (by ID or name).
+        /// Write log files only for this batch (by ID or name).
+        /// The exported database always contains all batches.
         #[arg(long)]
         batch: Option<String>,
     },
