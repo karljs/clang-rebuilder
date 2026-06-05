@@ -144,7 +144,9 @@ echo "--- Running sbuild (this will take a few minutes) ---"
 # Capture full output; we don't care about the build exit code because
 # the test is about the wrapper mechanism, not the hello build outcome.
 set +e
-sbuild \
+# Run sbuild from WORK_DIR so the .build file it writes lands there
+# and gets removed by the trap rather than littering the repo root.
+( cd "$WORK_DIR" && sbuild \
     --verbose \
     --batch \
     --chroot-mode=unshare \
@@ -152,7 +154,7 @@ sbuild \
     --chroot-setup-commands="$CHROOT_CMD" \
     --starting-build-commands="$STARTING_CMD" \
     --no-clean-source \
-    "$DSC" \
+    "$DSC" ) \
     2>&1 | tee "$LOG_FILE"
 SBUILD_EXIT=$?
 set -e
