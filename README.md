@@ -1,88 +1,92 @@
 # Rebuild Experiments
 
-Infrastructure for running instrumented Ubuntu archive rebuilds with Clang
-instead of GCC, to produce data that informs compiler toolchain decisions.
+Runs instrumented Ubuntu archive rebuilds with alternative compilers (Clang or GCC) to produce comparative data for toolchain decisions.
 
-## Structure
+## Layout
 
 ```
-rebuild-experiments/
-├── pipeline/       # Rust CLI — builds packages, records results
-│   └── src/
-├── viewer/         # Static HTML/JS report viewer
-└── .gitignore
+profiles/   — compiler profiles (TOML)
+pipeline/   — Rust CLI: fetches sources, drives sbuild, stores results
+viewer/     — static HTML/JS report UI
+tests/      — integration tests
 ```
 
-## Prerequisites
-
-- **Rust** (stable toolchain)
-- **sbuild** and **ubuntu-dev-tools**:
-  ```
-  sudo apt install sbuild ubuntu-dev-tools
-  ```
-- Your user must be in the `sbuild` group (`sbuild-adduser $USER`).
-  No chroot setup is needed — the pipeline uses `--chroot-mode=unshare`
-  which creates ephemeral chroots automatically.
-
-## Quick start
+## Setup
 
 ```bash
-# Build the pipeline
+sudo apt install sbuild ubuntu-dev-tools
+sbuild-adduser $USER   # then log out and back in
+```
+
+The pipeline uses `--chroot-mode=unshare`, so no persistent chroot setup is needed.
+
+## Usage
+
+```bash
 cd pipeline
 cargo build --release
+BIN=./target/release/rebuild-pipeline
 
-# Build three small packages with clang-18 targeting noble
-./target/release/rebuild-pipeline build \
-    --clang-version 18 \
-    --series noble \
-    --packages packages-smoke.txt
+# Run a batch
+$BIN build --profile ../profiles/clang-18-noble.toml --packages packages-smoke.txt
 
-# Check results
-./target/release/rebuild-pipeline status --latest
+# Check progress
+$BIN status --latest
 
 # Export for the viewer
-./target/release/rebuild-pipeline export --output-dir ../viewer/data
+$BIN export --output-dir ../viewer/data
 
 # Serve the viewer
-cd ../viewer
-python3 -m http.server 8000
-# Open http://localhost:8000
+python3 -m http.server 8000 --directory ../viewer
 ```
+
+## Profiles
+
+A profile is a TOML file declaring the compiler and any flag overrides:
+
+```toml
+[compiler]
+type = "clang"   # "clang" or "gcc"
+version = "18"
+
+[target]
+series = "noble"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Noble's dwz 0.15 doesn't support DWARF5"
+```
+
+Each `[[flags]]` entry includes a `reason` field to track why the workaround exists. Profiles are snapshotted into the database at build time, so results are always tied to the exact configuration used.
+
+| Profile | Description |
+|---|---|
+| `clang-18-noble.toml` | Clang 18, `-gdwarf-4` (dwz workaround) |
+| `clang-18-noble-vanilla.toml` | Clang 18, no extra flags |
+| `gcc-13-noble.toml` | GCC 13 baseline |
 
 ## How it works
 
-1. Each `build` invocation creates a **batch** (auto-named, e.g.
-   `clang-18-noble-20260529T163445`).
-2. For each package, the pipeline fetches the source from the Ubuntu
-   archive with `pull-lp-source` and builds it with `sbuild`.
-3. Inside the chroot, a setup script installs the target clang version
-   and replaces `/usr/bin/gcc` (and friends) with wrappers that exec
-   clang.  A verification step confirms `gcc --version` reports clang
-   before the build starts — if it doesn't, the build aborts.
-4. Resource usage (wall time, peak RSS) is captured via `/usr/bin/time -v`.
-5. Failed builds are scanned for ~40 error patterns (incompatible GCC
-   extensions, inline assembly issues, missing builtins, etc.).
-6. Everything is stored in a local SQLite database.
+For each package in a batch the pipeline:
 
-## CLI reference
+1. Fetches source from the Ubuntu archive via `pull-lp-source`.
+2. Runs `sbuild --chroot-mode=unshare` with the profile's compiler and flags.
+3. For Clang profiles: installs the target Clang version inside the ephemeral chroot and replaces `/usr/bin/gcc` (and `g++`, `cpp`) with thin wrapper scripts that exec Clang. A verification step confirms `gcc --version` reports Clang before the build starts.
+4. For GCC profiles: uses the stock compiler as-is.
+5. Scans failed build logs for ~40 known error patterns (incompatible extensions, inline assembly issues, missing builtins, etc.) and records findings.
+6. Stores everything in a local SQLite database.
+
+## CLI
 
 ```
-rebuild-pipeline build  --clang-version 18 --series noble --packages FILE
-                        [--timeout 14400] [-j JOBS] [--run-tests]
+rebuild-pipeline build   --profile FILE --packages FILE
+                         [--timeout SECS] [-j JOBS] [--run-tests]
 rebuild-pipeline list
-rebuild-pipeline status [--id ID_OR_NAME | --latest]
-rebuild-pipeline export --output-dir DIR [--batch ID_OR_NAME]
+rebuild-pipeline status  [--id ID_OR_NAME | --latest]
+rebuild-pipeline export  --output-dir DIR [--batch ID_OR_NAME]
 ```
-
-Use `--help` on any subcommand for details.
 
 ## Package list format
 
-One source package name per line.  Blank lines and `#` comments are skipped.
-
-```
-hello
-coreutils
-# skip this one
-grep
-```
+One source package name per line; blank lines and `#` comments are ignored.
