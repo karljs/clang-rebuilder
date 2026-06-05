@@ -1,0 +1,8 @@
+# GCC 13 on Noble -- baseline for build time and resource comparison.
+
+[compiler]
+type = "gcc"
+version = "13"
+
+[target]
+series = "noble"

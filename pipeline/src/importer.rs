@@ -3,7 +3,7 @@
 //! Creates a batch from a profile and imports pre-existing build logs
 //! with associated metadata.
 
-use crate::analyzer::{infer_status_from_log, scan_log};
+use crate::analyzer::{infer_status, scan_log};
 use crate::db;
 use crate::models::{BuildStatus, BuilderBackend};
 use crate::profile::Profile;
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
+use tokio::fs;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -27,8 +28,6 @@ pub struct BuildMetadata {
     pub build_duration_seconds: Option<f64>,
     #[serde(default)]
     pub peak_memory_mb: Option<i64>,
-    #[serde(default)]
-    pub disk_usage_mb: Option<i64>,
     #[serde(default)]
     pub submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -52,13 +51,11 @@ pub async fn import_from_directory(
     log_dir: &Path,
     metadata_path: &Path,
 ) -> Result<(Uuid, ImportStats)> {
-    // Load metadata file
-    let content = std::fs::read_to_string(metadata_path)
+    let content = fs::read_to_string(metadata_path).await
         .context("Failed to read metadata file")?;
     let metadata: MetadataFile =
         serde_json::from_str(&content).context("Failed to parse metadata file")?;
 
-    // Create batch
     let batch = db::create_batch(pool, profile, BuilderBackend::External).await?;
 
     info!(
@@ -69,14 +66,12 @@ pub async fn import_from_directory(
 
     let mut stats = ImportStats::default();
 
-    // Find all log files
-    let entries = std::fs::read_dir(log_dir).context("Failed to read log directory")?;
+    let mut entries = fs::read_dir(log_dir).await
+        .context("Failed to read log directory")?;
 
-    for entry in entries {
-        let entry = entry?;
+    while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
 
-        // Skip non-files
         if !path.is_file() {
             continue;
         }
@@ -84,14 +79,14 @@ pub async fn import_from_directory(
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
-        // Accept .log and .buildlog files
         if !filename.ends_with(".log") && !filename.ends_with(".buildlog") {
             continue;
         }
 
-        match import_single_log(pool, batch.id, &path, filename, &metadata).await {
+        match import_single_log(pool, batch.id, &path, &filename, &metadata).await {
             Ok(status) => {
                 stats.imported += 1;
                 match status {
@@ -109,7 +104,6 @@ pub async fn import_from_directory(
         }
     }
 
-    // Mark batch as finished
     db::finish_batch(pool, batch.id).await?;
 
     info!(
@@ -128,11 +122,9 @@ async fn import_single_log(
     filename: &str,
     metadata: &MetadataFile,
 ) -> Result<BuildStatus> {
-    // Read log content
-    let log_content =
-        std::fs::read_to_string(log_path).context("Failed to read log file")?;
+    let log_content = fs::read_to_string(log_path).await
+        .context("Failed to read log file")?;
 
-    // Get metadata for this log
     let build_meta = metadata
         .builds
         .get(filename)
@@ -143,14 +135,13 @@ async fn import_single_log(
         .as_ref()
         .and_then(|s| s.parse().ok());
 
-    // Determine status: use explicit if provided, otherwise infer from log
-    let status = explicit_status.unwrap_or_else(|| infer_status_from_log(&log_content));
+    // Use explicit status from metadata if provided, otherwise infer from log content.
+    let status = explicit_status.unwrap_or_else(|| infer_status(&log_content, None));
 
     let now = Utc::now();
     let submitted_at = build_meta.submitted_at.unwrap_or(now);
     let completed_at = build_meta.completed_at.or(Some(now));
 
-    // Insert build record
     let build = db::insert_build(
         pool,
         &db::NewBuild {
@@ -160,7 +151,6 @@ async fn import_single_log(
             status,
             build_duration_seconds: build_meta.build_duration_seconds,
             peak_memory_mb: build_meta.peak_memory_mb,
-            disk_usage_mb: build_meta.disk_usage_mb,
             build_log: Some(&log_content),
             compiler_detected: None,
             submitted_at,
@@ -176,7 +166,7 @@ async fn import_single_log(
     );
 
     // Scan log for error patterns if build failed
-    if matches!(status, BuildStatus::Failed | BuildStatus::Timeout) {
+    if status.should_analyze_log() {
         let findings = scan_log(&log_content);
         for finding in findings {
             db::insert_finding(

@@ -36,6 +36,12 @@ impl BatchStats {
 }
 
 /// Parameters for inserting a new build record.
+///
+/// Uses borrowed strings (`&'a str`) on the insert path to avoid cloning data
+/// that is already in a local buffer. The owned `Build` type returned by query
+/// functions is a separate struct for the same reason: sqlx rows yield owned
+/// `String` values, so the two types serve different lifetimes and cannot
+/// easily be unified without unnecessary allocations.
 pub struct NewBuild<'a> {
     pub batch_id: Uuid,
     pub source_package: &'a str,
@@ -43,7 +49,6 @@ pub struct NewBuild<'a> {
     pub status: BuildStatus,
     pub build_duration_seconds: Option<f64>,
     pub peak_memory_mb: Option<i64>,
-    pub disk_usage_mb: Option<i64>,
     pub build_log: Option<&'a str>,
     pub compiler_detected: Option<&'a str>,
     pub submitted_at: DateTime<Utc>,
@@ -224,9 +229,9 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     sqlx::query(
         "INSERT INTO builds (
             id, batch_id, source_package, version, status,
-            build_duration_seconds, peak_memory_mb, disk_usage_mb,
+            build_duration_seconds, peak_memory_mb,
             build_log, compiler_detected, submitted_at, completed_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(b.batch_id.to_string())
@@ -235,7 +240,6 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     .bind(b.status.as_str())
     .bind(b.build_duration_seconds)
     .bind(b.peak_memory_mb)
-    .bind(b.disk_usage_mb)
     .bind(b.build_log)
     .bind(b.compiler_detected)
     .bind(b.submitted_at.to_rfc3339())
@@ -252,7 +256,6 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         status: b.status,
         build_duration_seconds: b.build_duration_seconds,
         peak_memory_mb: b.peak_memory_mb,
-        disk_usage_mb: b.disk_usage_mb,
         build_log: b.build_log.map(|s| s.to_string()),
         compiler_detected: b.compiler_detected.map(|s| s.to_string()),
         submitted_at: b.submitted_at,
@@ -264,7 +267,7 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
 pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
-                build_duration_seconds, peak_memory_mb, disk_usage_mb,
+                build_duration_seconds, peak_memory_mb,
                 build_log, compiler_detected, submitted_at, completed_at
          FROM builds WHERE batch_id = ? ORDER BY submitted_at",
     )
@@ -294,7 +297,6 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
             .map_err(|e: String| anyhow::anyhow!(e))?,
         build_duration_seconds: row.get("build_duration_seconds"),
         peak_memory_mb: row.get("peak_memory_mb"),
-        disk_usage_mb: row.get("disk_usage_mb"),
         build_log: row.get("build_log"),
         compiler_detected: row.get("compiler_detected"),
         submitted_at: DateTime::parse_from_rfc3339(&submitted_str)?.with_timezone(&Utc),

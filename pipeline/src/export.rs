@@ -95,16 +95,15 @@ pub async fn export_data(
     output_dir: &Path,
     batch_filter: Option<&[Uuid]>,
 ) -> Result<()> {
-    // Create directory structure
     fs::create_dir_all(output_dir).await?;
     fs::create_dir_all(output_dir.join("batches")).await?;
     fs::create_dir_all(output_dir.join("builds")).await?;
     fs::create_dir_all(output_dir.join("logs")).await?;
 
-    // Get all batches (for index.json, always include all for navigation)
+    // Always export all batches to index.json so the viewer's navigation is complete,
+    // even when only a subset is being fully exported.
     let all_batches = db::list_batches(pool).await?;
 
-    // Build index with summaries
     let mut batch_summaries = Vec::new();
     for batch in &all_batches {
         let stats = db::get_batch_stats(pool, batch.id).await?;
@@ -127,12 +126,10 @@ pub async fn export_data(
         });
     }
 
-    // Write index.json
     let index_json = serde_json::to_string_pretty(&batch_summaries)?;
     fs::write(output_dir.join("index.json"), index_json).await?;
     info!("Wrote index.json with {} batches", batch_summaries.len());
 
-    // Determine which batches to fully export
     let batches_to_export: Vec<_> = if let Some(filter) = batch_filter {
         all_batches
             .into_iter()
@@ -142,7 +139,6 @@ pub async fn export_data(
         all_batches
     };
 
-    // Export each batch
     for batch in batches_to_export {
         export_batch(pool, output_dir, &batch).await?;
     }
@@ -158,13 +154,9 @@ async fn export_batch(
 ) -> Result<()> {
     info!(batch_name = %batch.name, "Exporting batch");
 
-    // Get builds for this batch
     let builds = db::get_builds_for_batch(pool, batch.id).await?;
-
-    // Get finding summary
     let finding_stats = db::get_finding_stats(pool, batch.id).await?;
 
-    // Build the batch detail
     let mut build_summaries = Vec::new();
     for build in &builds {
         let finding_count = db::get_finding_count_for_build(pool, build.id).await?;
@@ -195,7 +187,6 @@ async fn export_batch(
             .collect(),
     };
 
-    // Write batch detail
     let batch_json = serde_json::to_string_pretty(&batch_detail)?;
     fs::write(
         output_dir.join("batches").join(format!("{}.json", batch.id)),
@@ -203,7 +194,6 @@ async fn export_batch(
     )
     .await?;
 
-    // Export each build's details and log
     for build in builds {
         export_build(pool, output_dir, &build).await?;
     }
@@ -217,7 +207,6 @@ async fn export_build(
     output_dir: &Path,
     build: &db::Build,
 ) -> Result<()> {
-    // Get findings for this build
     let findings = db::get_findings_for_build(pool, build.id).await?;
 
     let build_detail = BuildDetail {
@@ -239,7 +228,6 @@ async fn export_build(
             .collect(),
     };
 
-    // Write build detail
     let build_json = serde_json::to_string_pretty(&build_detail)?;
     fs::write(
         output_dir.join("builds").join(format!("{}.json", build.id)),

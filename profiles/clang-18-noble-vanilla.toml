@@ -1,0 +1,10 @@
+# Clang 18 on Noble with no extra flags -- pure drop-in baseline.
+# Use this to measure the total gap between GCC and Clang, including
+# toolchain issues like dwz/DWARF5 incompatibility.
+
+[compiler]
+type = "clang"
+version = "18"
+
+[target]
+series = "noble"

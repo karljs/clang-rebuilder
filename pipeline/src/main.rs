@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
             println!("  Compiler: {} {}", batch.compiler_type, batch.compiler_version);
             println!("  Series: {}", batch.series);
             println!("  Profile: {}", batch.profile_name);
-            println!("  Backend: {}", batch.builder_backend.as_str());
+            println!("  Backend: {}", batch.builder_backend);
             println!("  Started: {}", batch.started_at);
             if let Some(finished) = batch.finished_at {
                 println!("  Finished: {finished}");
@@ -245,14 +245,17 @@ async fn resolve_batch(
             .context("No batches found");
     }
 
-    let s = id_or_name.unwrap();
-    if let Ok(uuid) = Uuid::parse_str(s) {
-        db::get_batch(pool, uuid)
-            .await?
-            .context("Batch not found")
+    if let Some(s) = id_or_name {
+        if let Ok(uuid) = Uuid::parse_str(s) {
+            db::get_batch(pool, uuid)
+                .await?
+                .context("Batch not found")
+        } else {
+            db::get_batch_by_name(pool, s)
+                .await?
+                .context("Batch not found")
+        }
     } else {
-        db::get_batch_by_name(pool, s)
-            .await?
-            .context("Batch not found")
+        unreachable!("id_or_name is Some, checked above")
     }
 }

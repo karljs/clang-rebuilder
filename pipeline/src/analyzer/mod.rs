@@ -4,6 +4,8 @@ mod patterns;
 
 pub use patterns::{match_pattern, ErrorPattern, CLANG_ERROR_PATTERNS};
 
+use crate::models::BuildStatus;
+
 /// A finding extracted from a build log
 #[derive(Debug, Clone)]
 pub struct Finding {
@@ -27,7 +29,6 @@ pub fn scan_log(log: &str) -> Vec<Finding> {
 
     for (idx, line) in lines.iter().enumerate() {
         if let Some(pattern) = match_pattern(line) {
-            // Only keep first occurrence of each category
             if seen_categories.insert(pattern.key) {
                 let excerpt = extract_context(&lines, idx, 2);
                 findings.push(Finding {
@@ -50,34 +51,49 @@ fn extract_context(lines: &[&str], line_idx: usize, context: usize) -> String {
     lines[start..end].join("\n")
 }
 
-/// Determine build status from log content
+/// Determine build status from log content and an optional process exit code.
 ///
-/// Looks for common success/failure indicators in the log
-pub fn infer_status_from_log(log: &str) -> crate::models::BuildStatus {
-    // Check for dependency wait indicators
+/// `exit_code` should be the exit status of the build process when known (the
+/// builder passes it; the log importer passes `None`). A non-zero exit code
+/// prevents a success determination even when a success marker is present in
+/// the log, which guards against partial logs that end mid-flight.
+///
+/// Checks are ordered from most specific to least: timeout, dep-wait, success,
+/// then failure as the default.
+pub fn infer_status(log: &str, exit_code: Option<i32>) -> BuildStatus {
+    if log.contains("Build killed") || log.contains("Timed out") {
+        return BuildStatus::Timeout;
+    }
+
     if log.contains("unsatisfiable build-dependencies")
         || log.contains("build-dependency not installable")
+        || log.contains("Dependency wait")
     {
-        return crate::models::BuildStatus::DepWait;
+        return BuildStatus::DepWait;
     }
 
-    // Check for timeout
-    if log.contains("Build killed with signal") || log.contains("Timed out") {
-        return crate::models::BuildStatus::Timeout;
-    }
+    let clean_exit = exit_code.map_or(true, |c| c == 0);
 
-    // Check for success indicators (dpkg-buildpackage, sbuild, etc.)
-    if log.contains("dpkg-buildpackage: info: binary-only upload")
-        || log.contains("Build finished successfully")
-        || log.contains("dpkg-deb: building package")
-            && !log.contains("error:")
-            && !log.contains("FAILED")
+    // The dpkg-deb line alone is not enough to call a build successful;
+    // guard it against error markers that can appear in the same log.
+    if clean_exit
+        && (log.contains("Build finished successfully")
+            || log.contains("dpkg-buildpackage: info: binary-only upload")
+            || (log.contains("dpkg-deb: building package")
+                && !log.contains("error:")
+                && !log.contains("FAILED")
+                && !log.contains("Build failure")))
     {
-        return crate::models::BuildStatus::Succeeded;
+        return BuildStatus::Succeeded;
     }
 
-    // Default to failed if we can't determine success
-    crate::models::BuildStatus::Failed
+    BuildStatus::Failed
+}
+
+#[allow(deprecated)]
+#[deprecated(note = "use infer_status(log, None) instead")]
+pub fn infer_status_from_log(log: &str) -> BuildStatus {
+    infer_status(log, None)
 }
 
 #[cfg(test)]
@@ -116,18 +132,34 @@ error: undefined reference to `baz'
     #[test]
     fn test_infer_status_depwait() {
         let log = "E: unsatisfiable build-dependencies for package";
-        assert_eq!(
-            infer_status_from_log(log),
-            crate::models::BuildStatus::DepWait
-        );
+        assert_eq!(infer_status(log, None), BuildStatus::DepWait);
     }
 
     #[test]
     fn test_infer_status_timeout() {
         let log = "Build killed with signal TERM";
-        assert_eq!(
-            infer_status_from_log(log),
-            crate::models::BuildStatus::Timeout
-        );
+        assert_eq!(infer_status(log, None), BuildStatus::Timeout);
+    }
+
+    #[test]
+    fn test_infer_status_success() {
+        let log = "Build finished successfully";
+        assert_eq!(infer_status(log, Some(0)), BuildStatus::Succeeded);
+        assert_eq!(infer_status(log, None), BuildStatus::Succeeded);
+    }
+
+    #[test]
+    fn test_infer_status_nonzero_exit_suppresses_success() {
+        // A success marker in the log should not win against a non-zero exit.
+        let log = "Build finished successfully";
+        assert_eq!(infer_status(log, Some(1)), BuildStatus::Failed);
+    }
+
+    #[test]
+    fn test_infer_status_dependency_wait_sbuild_marker() {
+        // "Dependency wait" is the sbuild-specific marker not present in the
+        // old infer_status_from_log; verify it is handled.
+        let log = "Dependency wait: libfoo-dev";
+        assert_eq!(infer_status(log, Some(1)), BuildStatus::DepWait);
     }
 }

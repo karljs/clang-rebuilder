@@ -28,8 +28,17 @@ impl BuildStatus {
         }
     }
 
+    /// Returns true if the build has reached a final state (no longer pending or running).
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout)
+    }
+
+    /// Returns true if the build log should be scanned for error patterns.
+    ///
+    /// Only failed and timed-out builds produce actionable findings; succeeded
+    /// and dep-wait builds don't need log analysis.
+    pub fn should_analyze_log(&self) -> bool {
+        matches!(self, Self::Failed | Self::Timeout)
     }
 }
 
@@ -87,6 +96,12 @@ impl std::str::FromStr for BuilderBackend {
     }
 }
 
+impl std::fmt::Display for BuilderBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A batch is a collection of builds sharing a compiler profile.
 /// Each `build` invocation creates a new batch automatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +128,6 @@ pub struct Build {
     pub status: BuildStatus,
     pub build_duration_seconds: Option<f64>,
     pub peak_memory_mb: Option<i64>,
-    pub disk_usage_mb: Option<i64>,
     pub build_log: Option<String>,
     pub compiler_detected: Option<String>,
     pub submitted_at: DateTime<Utc>,
@@ -139,7 +153,6 @@ pub struct BuildResult {
     pub status: BuildStatus,
     pub build_duration_seconds: Option<f64>,
     pub peak_memory_mb: Option<i64>,
-    pub disk_usage_mb: Option<i64>,
     pub build_log: String,
     pub compiler_detected: Option<String>,
 }

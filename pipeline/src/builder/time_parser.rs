@@ -1,8 +1,14 @@
 //! Parser for /usr/bin/time -v output
 
 use crate::models::ResourceMetrics;
+use tracing::warn;
 
-/// Parse the output of `/usr/bin/time -v` to extract resource metrics
+/// Parse the output of `/usr/bin/time -v` to extract resource metrics.
+///
+/// Returns a fully populated `ResourceMetrics` on success. Individual fields
+/// are `None` when their line is absent from the output. If the output string
+/// is non-empty but no recognised field is found, a warning is logged so that
+/// silent failures don't go unnoticed in production runs.
 ///
 /// The output format looks like:
 /// ```text
@@ -33,6 +39,10 @@ pub fn parse_time_output(output: &str) -> ResourceMetrics {
         } else if let Some(value) = line.strip_prefix("Exit status: ") {
             metrics.exit_status = value.parse().ok();
         }
+    }
+
+    if !output.trim().is_empty() && metrics.exit_status.is_none() && metrics.wall_time_seconds.is_none() {
+        warn!("Non-empty /usr/bin/time output but no recognisable fields parsed — check time output format");
     }
 
     metrics

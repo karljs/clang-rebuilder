@@ -95,7 +95,6 @@ pub async fn run_batch(
                     status: BuildStatus::Failed,
                     build_duration_seconds: None,
                     peak_memory_mb: None,
-                    disk_usage_mb: None,
                     build_log: format!("Build failed to execute: {e}"),
                     compiler_detected: None,
                 };
@@ -164,7 +163,6 @@ async fn build_package(
         status: result.status,
         build_duration_seconds: result.duration_seconds,
         peak_memory_mb: result.peak_memory_mb,
-        disk_usage_mb: None,
         build_log: result.log,
         compiler_detected: result.compiler_detected,
     })
@@ -187,7 +185,6 @@ async fn store_build_result(
             status: result.status,
             build_duration_seconds: result.build_duration_seconds,
             peak_memory_mb: result.peak_memory_mb,
-            disk_usage_mb: None,
             build_log: Some(&result.build_log),
             compiler_detected: result.compiler_detected.as_deref(),
             submitted_at: now,
@@ -196,7 +193,7 @@ async fn store_build_result(
     )
     .await?;
 
-    if matches!(result.status, BuildStatus::Failed | BuildStatus::Timeout) {
+    if result.status.should_analyze_log() {
         for finding in scan_log(&result.build_log) {
             db::insert_finding(
                 pool,

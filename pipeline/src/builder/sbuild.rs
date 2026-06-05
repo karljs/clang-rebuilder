@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::builder::time_parser::parse_time_output;
+use crate::analyzer::infer_status;
 use crate::models::BuildStatus;
 use crate::profile::CompilerType;
 
@@ -46,6 +47,7 @@ use crate::profile::CompilerType;
 const CHROOT_SETUP_SCRIPT: &str = include_str!("scripts/chroot_setup.sh");
 const STARTING_BUILD_SCRIPT: &str = include_str!("scripts/starting_build.sh");
 const GCC_VERIFY_SCRIPT: &str = include_str!("scripts/gcc_verify.sh");
+const SBUILD_CONFIG_TEMPLATE: &str = include_str!("scripts/sbuild_config.pl.tmpl");
 
 /// Configuration for a single sbuild invocation.
 pub struct SbuildConfig {
@@ -82,7 +84,7 @@ pub struct SbuildResult {
 /// `timeout(1)` command) to avoid process-hierarchy issues that caused
 /// orphaned chroot processes in earlier iterations.
 pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
-    let mut cmd = build_command(config)?;
+    let (mut cmd, _config_file) = build_command(config)?;
 
     debug!("Spawning: {:?}", cmd);
 
@@ -167,10 +169,11 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     let metrics = parse_time_output(&time_output);
     let compiler_detected = detect_compiler_from_log(&log, config.compiler_type);
 
+    let exit_code = metrics.exit_status.or_else(|| exit_status.code());
     let status = if timed_out {
         BuildStatus::Timeout
     } else {
-        determine_status(exit_status.code(), &log, metrics.exit_status)
+        infer_status(&log, exit_code)
     };
 
     Ok(SbuildResult {
@@ -186,19 +189,23 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
 // Command construction
 // ---------------------------------------------------------------------------
 
-/// Assemble the full `Command` for `/usr/bin/time -v sbuild …`.
+/// Assemble the full `Command` for `/usr/bin/time -v sbuild ...`.
 ///
 /// For clang profiles, injects chroot-setup (clang install) and
-/// starting-build (gcc-to-clang wrapper) scripts.  For gcc profiles,
+/// starting-build (gcc-to-clang wrapper) scripts. For gcc profiles,
 /// only injects a lightweight verification script.
-fn build_command(config: &SbuildConfig) -> Result<Command> {
+///
+/// Returns the command together with the temporary sbuild config file.
+/// The caller must keep the file handle alive until the child process exits,
+/// otherwise the file is deleted before sbuild reads it.
+fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempFile)> {
     let dsc_dir = config.dsc_path.parent().context("Invalid .dsc path")?;
 
     let sbuild_config_file = generate_sbuild_config(config.jobs, config.run_tests, &config.build_env)?;
 
     // sbuild's unshare mode extracts chroots into $TMPDIR which defaults to
-    // /tmp.  On this machine /tmp is a 44 GB tmpfs — large builds exhaust it.
-    // Redirect to real disk instead.
+    // /tmp. On this machine /tmp is a 44 GB tmpfs and large builds exhaust it,
+    // so redirect to real disk instead.
     let scratch_dir = PathBuf::from("/var/tmp/rebuild-builds");
     std::fs::create_dir_all(&scratch_dir)
         .context("Failed to create /var/tmp/rebuild-builds")?;
@@ -211,7 +218,6 @@ fn build_command(config: &SbuildConfig) -> Result<Command> {
         .arg("--chroot-mode=unshare")
         .arg(format!("--dist={}", config.series));
 
-    // Compiler-specific setup scripts.
     match config.compiler_type {
         CompilerType::Clang => {
             let setup_cmd = wrap_in_heredoc(
@@ -258,11 +264,7 @@ fn build_command(config: &SbuildConfig) -> Result<Command> {
         });
     }
 
-    // Keep the temp file alive for the lifetime of the command by leaking the
-    // handle.  The OS will clean it up when the process exits.
-    std::mem::forget(sbuild_config_file);
-
-    Ok(cmd)
+    Ok((cmd, sbuild_config_file))
 }
 
 /// Wrap a shell script body in a heredoc that writes it to a temp file inside
@@ -280,7 +282,7 @@ fn wrap_in_heredoc(filename: &str, delimiter: &str, body: &str) -> String {
 /// Generate a Perl config file that overrides the user's `~/.sbuildrc`.
 ///
 /// Loaded via `SBUILD_CONFIG` which sbuild evaluates after system and user
-/// configs, so all assignments here take precedence.  Profile flags are
+/// configs, so all assignments here take precedence. Profile flags are
 /// injected into `$build_environment` so they reach `dpkg-buildpackage`.
 fn generate_sbuild_config(
     jobs: usize,
@@ -289,16 +291,19 @@ fn generate_sbuild_config(
 ) -> Result<tempfile::NamedTempFile> {
     let nocheck = if run_tests { "" } else { " nocheck" };
 
-    // Build the Perl hash entries for $build_environment.
+    // Build the Perl hash entries for $build_environment. Each entry is a
+    // bare key-value pair; the template provides the surrounding indentation.
     let mut env_entries = vec![
-        format!("    'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',"),
+        format!("'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',"),
     ];
     for (var, value) in build_env {
-        // Perl single-quote escaping: replace ' with '\'' .
+        // Perl single-quote escaping: ' becomes '\''
         let escaped = value.replace('\'', "'\\''");
-        env_entries.push(format!("    '{var}' => '{escaped}',"));
+        env_entries.push(format!("'{var}' => '{escaped}',"));
     }
-    let env_block = env_entries.join("\n");
+    let env_block = env_entries.join("\n    ");
+
+    let config = SBUILD_CONFIG_TEMPLATE.replace("__ENV_BLOCK__", &env_block);
 
     let mut file = tempfile::Builder::new()
         .prefix("rebuild-sbuild-")
@@ -306,33 +311,8 @@ fn generate_sbuild_config(
         .tempfile()
         .context("Failed to create temporary sbuild config")?;
 
-    write!(
-        file,
-        r#"# Auto-generated sbuild config for rebuild experiments.
-# Loaded via SBUILD_CONFIG after user config; all values here win.
-
-$build_environment = {{
-{env_block}
-}};
-
-$external_commands = {{
-    'build-failed-commands' => [],
-    'build-deps-failed-commands' => [],
-    'chroot-update-failed-commands' => [],
-    'anything-failed-commands' => [],
-}};
-
-$purge_build_directory = 'always';
-$purge_session = 'always';
-$purge_build_deps = 'always';
-
-$run_lintian = 0;
-$clean_source = 0;
-
-1;
-"#
-    )
-    .context("Failed to write sbuild config")?;
+    file.write_all(config.as_bytes())
+        .context("Failed to write sbuild config")?;
 
     debug!("Generated sbuild config at {:?}", file.path());
     Ok(file)
@@ -459,36 +439,6 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
     "UNKNOWN: no compiler verification markers found in log".into()
 }
 
-/// Map sbuild exit codes and log content to a `BuildStatus`.
-fn determine_status(
-    wrapper_exit: Option<i32>,
-    log: &str,
-    time_exit: Option<i32>,
-) -> BuildStatus {
-    let exit_code = time_exit.or(wrapper_exit).unwrap_or(-1);
-
-    if log.contains("Build killed") || log.contains("Timed out") {
-        return BuildStatus::Timeout;
-    }
-
-    if log.contains("unsatisfiable build-dependencies")
-        || log.contains("build-dependency not installable")
-        || log.contains("Dependency wait")
-    {
-        return BuildStatus::DepWait;
-    }
-
-    if exit_code == 0
-        && (log.contains("Build finished successfully")
-            || log.contains("dpkg-buildpackage: info: binary-only upload")
-            || (log.contains("dpkg-deb: building package") && !log.contains("Build failure")))
-    {
-        return BuildStatus::Succeeded;
-    }
-
-    BuildStatus::Failed
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -496,44 +446,6 @@ fn determine_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- determine_status ---------------------------------------------------
-
-    #[test]
-    fn status_success() {
-        let log = "lots of output\nBuild finished successfully\n";
-        assert_eq!(
-            determine_status(Some(0), log, Some(0)),
-            BuildStatus::Succeeded
-        );
-    }
-
-    #[test]
-    fn status_failed() {
-        let log = "error: something broke\nBuild failure\n";
-        assert_eq!(
-            determine_status(Some(1), log, Some(1)),
-            BuildStatus::Failed
-        );
-    }
-
-    #[test]
-    fn status_timeout_in_log() {
-        let log = "output\nBuild killed\n";
-        assert_eq!(
-            determine_status(Some(1), log, Some(1)),
-            BuildStatus::Timeout
-        );
-    }
-
-    #[test]
-    fn status_depwait() {
-        let log = "E: unsatisfiable build-dependencies\n";
-        assert_eq!(
-            determine_status(Some(1), log, Some(1)),
-            BuildStatus::DepWait
-        );
-    }
 
     // -- shell script generation --------------------------------------------
 

@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS builds (
     status TEXT NOT NULL,
     build_duration_seconds REAL,
     peak_memory_mb INTEGER,
-    disk_usage_mb INTEGER,
     build_log TEXT,
     compiler_detected TEXT,
     submitted_at TEXT NOT NULL,
@@ -53,6 +52,9 @@ CREATE TABLE IF NOT EXISTS build_findings (
 CREATE INDEX IF NOT EXISTS idx_findings_build ON build_findings(build_id);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON build_findings(category);
 
+-- binary_metrics is reserved for a future feature that will compare binary
+-- sizes and symbol counts across compiler profiles. No Rust code reads or
+-- writes this table yet.
 CREATE TABLE IF NOT EXISTS binary_metrics (
     id TEXT PRIMARY KEY,
     build_id TEXT NOT NULL REFERENCES builds(id),
