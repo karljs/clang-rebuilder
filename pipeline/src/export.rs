@@ -3,14 +3,40 @@
 //! The exported `rebuild.db` contains all batches but with `build_log` columns
 //! nulled out, keeping the file small enough for the browser to load via sql.js.
 //! Build logs are written separately to `logs/<build-id>.log` and fetched on demand.
+//!
+//! The export also materialises a `profile_configs` table derived from the
+//! snapshotted `profile_content` TOML stored in each batch row.  This lets the
+//! viewer treat profile configurations as first-class queryable entities without
+//! parsing TOML in JavaScript.
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeSet;
 use std::path::Path;
 use tokio::fs;
 use tracing::info;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Minimal profile deserialisation — only the [[flags]] section is needed here.
+// Using a separate struct (not profile::Profile) so this stays forward-compatible
+// if Profile gains new fields with deny_unknown_fields.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ProfileForExport {
+    #[serde(default)]
+    flags: Vec<FlagForExport>,
+}
+
+#[derive(Deserialize)]
+struct FlagForExport {
+    var: String,
+    flag: String,
+    reason: String,
+}
 
 /// Export data to the output directory.
 ///
@@ -56,9 +82,102 @@ pub async fn export_data(
         .await
         .context("Failed to compact export database")?;
 
+    write_profile_configs(&export_pool).await?;
+
     export_pool.close().await;
 
     info!(path = %db_path.display(), "Wrote export database");
+    Ok(())
+}
+
+/// Materialise the `profile_configs` table in the export database.
+///
+/// Each row represents one distinct profile (by profile_name).  The flags are
+/// parsed from the snapshotted TOML and reduced to a human-readable summary
+/// and a full JSON representation for the viewer to use without any TOML parsing.
+async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS profile_configs (
+            id           TEXT PRIMARY KEY,
+            profile_name TEXT NOT NULL,
+            has_flags    INTEGER NOT NULL,
+            flag_summary TEXT NOT NULL,
+            flags_json   TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create profile_configs table")?;
+
+    // One row per distinct profile_name (profiles are snapshotted per batch but
+    // the name uniquely identifies a profile file).
+    let rows = sqlx::query(
+        "SELECT DISTINCT profile_name, profile_content FROM batches ORDER BY profile_name",
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch distinct profiles")?;
+
+    let mut count = 0usize;
+    for row in rows {
+        let profile_name: String = row.get("profile_name");
+        let content: String = row.get("profile_content");
+
+        let parsed: ProfileForExport = toml::from_str(&content).with_context(|| {
+            format!("Failed to parse profile_content for '{profile_name}'")
+        })?;
+
+        // Collect unique flag *values* (deduplicated — the same flag is often
+        // applied to both DEB_CFLAGS_APPEND and DEB_CXXFLAGS_APPEND).
+        let unique_flags: BTreeSet<String> =
+            parsed.flags.iter().map(|f| f.flag.clone()).collect();
+
+        let has_flags = if unique_flags.is_empty() { 0i64 } else { 1i64 };
+
+        let flag_summary = match unique_flags.len() {
+            0 => "baseline".to_string(),
+            1 => unique_flags.iter().next().unwrap().clone(),
+            2 => unique_flags.iter().cloned().collect::<Vec<_>>().join(", "),
+            n => {
+                let first_two: Vec<_> = unique_flags.iter().take(2).cloned().collect();
+                format!("{} +{} more", first_two.join(", "), n - 2)
+            }
+        };
+
+        // Full JSON for tooltip detail: include var, flag, reason for every entry.
+        let flags_json = serde_json::to_string(
+            &parsed
+                .flags
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "var": f.var,
+                        "flag": f.flag,
+                        "reason": f.reason
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .context("Failed to serialise flags_json")?;
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO profile_configs
+             (id, profile_name, has_flags, flag_summary, flags_json)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&profile_name)
+        .bind(&profile_name)
+        .bind(has_flags)
+        .bind(&flag_summary)
+        .bind(&flags_json)
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to insert profile_config for '{profile_name}'"))?;
+
+        count += 1;
+    }
+
+    info!(count, "Wrote profile_configs");
     Ok(())
 }
 
