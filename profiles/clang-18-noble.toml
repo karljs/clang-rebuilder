@@ -1,4 +1,5 @@
-# Clang 18 on Noble with workarounds for known toolchain issues.
+# Clang 18 on Noble — standard profile, no extra flags.
+# Use this to measure the baseline drop-in replacement gap between GCC and Clang.
 
 [compiler]
 type = "clang"
@@ -6,13 +7,3 @@ version = "18"
 
 [target]
 series = "noble"
-
-[[flags]]
-var = "DEB_CFLAGS_APPEND"
-flag = "-gdwarf-4"
-reason = "Noble's dwz 0.15 doesn't support DWARF5 (Clang 18 defaults to DWARF5)"
-
-[[flags]]
-var = "DEB_CXXFLAGS_APPEND"
-flag = "-gdwarf-4"
-reason = "Noble's dwz 0.15 doesn't support DWARF5 (Clang 18 defaults to DWARF5)"

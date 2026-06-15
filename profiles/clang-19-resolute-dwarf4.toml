@@ -1,0 +1,20 @@
+# Clang 19 on Resolute with -gdwarf-4 workaround.
+# Resolute's dwz 0.16 does not fully support DWARF5 output from Clang.
+# This flag forces DWARF4 output, which dwz can process correctly.
+
+[compiler]
+type = "clang"
+version = "19"
+
+[target]
+series = "resolute"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Resolute's dwz 0.16 does not fully support DWARF5 output from Clang 19"
+
+[[flags]]
+var = "DEB_CXXFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Resolute's dwz 0.16 does not fully support DWARF5 output from Clang 19"

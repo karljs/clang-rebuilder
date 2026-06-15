@@ -193,8 +193,8 @@ async fn store_build_result(
     )
     .await?;
 
-    if result.status.should_analyze_log() {
-        for finding in scan_log(&result.build_log) {
+    if result.status.should_scan_for_errors() || result.status.should_scan_for_observations() {
+        for finding in scan_log(&result.build_log, result.status) {
             db::insert_finding(
                 pool,
                 build.id,
@@ -202,6 +202,7 @@ async fn store_build_result(
                 &finding.description,
                 &finding.excerpt,
                 Some(finding.line_number as i64),
+                finding.severity,
             )
             .await?;
         }

@@ -1,4 +1,4 @@
-# Clang 20 on Noble — standard profile, no extra flags.
+# Clang 20 on Resolute — standard profile, no extra flags.
 # Use this to measure the baseline drop-in replacement gap between GCC and Clang.
 
 [compiler]
@@ -6,4 +6,4 @@ type = "clang"
 version = "20"
 
 [target]
-series = "noble"
+series = "resolute"

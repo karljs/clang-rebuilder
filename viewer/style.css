@@ -269,6 +269,16 @@ body {
 .findings-bar-count { font-weight: 600; font-family: var(--mono); min-width: 22px; text-align: right; flex-shrink: 0; }
 .findings-bar-label { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .findings-bar-unanalyzed .findings-bar-label { color: var(--text-3); font-style: italic; }
+/* Observation items use amber instead of implicit red */
+.findings-bar-observation .findings-bar-count { color: var(--yellow); }
+.findings-bar-observation .findings-bar-label { color: var(--text-3); }
+/* Section labels */
+.findings-section-label {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.4px; margin-bottom: 2px;
+}
+.findings-label-error       { color: var(--red); }
+.findings-label-observation { color: var(--yellow); }
 
 /* ════════════════════════════════════════════════
    Tables (shared)
@@ -465,9 +475,14 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 
 /* Finding details */
 .finding-detail { border-left: 3px solid var(--red); padding: 6px 10px; margin-bottom: 8px; }
+.finding-detail-observation { border-left-color: var(--yellow); }
 .finding-detail h4 { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
 .finding-detail p  { font-size: 12px; color: var(--text-2); margin-bottom: 2px; }
 .finding-detail pre { font-family: var(--mono); font-size: 11px; background: #f6f8fa; padding: 6px; border-radius: 2px; overflow-x: auto; white-space: pre-wrap; }
+.finding-group-label {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--yellow); margin: 8px 0 4px;
+}
 
 /* Log viewer */
 .log-viewer { font-family: var(--mono); font-size: 12px; color: #e6edf3; white-space: pre; }
@@ -475,6 +490,14 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .line-num { color: #636e7b; min-width: 4ch; text-align: right; padding-right: 12px; user-select: none; flex-shrink: 0; }
 .line-text { flex: 1; }
 .search-hit { background: #e3b341; color: #1b1f23; border-radius: 1px; }
+.log-loading {
+    padding: 2rem; color: #8b949e; font-family: var(--mono); font-size: 13px;
+}
+.log-unavailable {
+    padding: 2rem; max-width: 480px;
+}
+.log-unavailable p { color: #8b949e; font-size: 13px; margin-bottom: 0.5rem; line-height: 1.5; }
+.log-unavailable p:first-child { color: #e6edf3; font-weight: 600; }
 
 /* ════════════════════════════════════════════════
    Custom dropdown

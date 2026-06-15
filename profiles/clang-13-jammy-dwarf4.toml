@@ -1,0 +1,20 @@
+# Clang 13 on Jammy with -gdwarf-4 workaround.
+# Jammy's dwz 0.14 does not fully support DWARF5 output from Clang.
+# This flag forces DWARF4 output, which dwz can process correctly.
+
+[compiler]
+type = "clang"
+version = "13"
+
+[target]
+series = "jammy"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Jammy's dwz 0.14 does not fully support DWARF5 output from Clang 13"
+
+[[flags]]
+var = "DEB_CXXFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Jammy's dwz 0.14 does not fully support DWARF5 output from Clang 13"

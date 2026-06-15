@@ -28,17 +28,23 @@ impl BuildStatus {
         }
     }
 
-    /// Returns true if the build has reached a final state (no longer pending or running).
+    /// Returns true if the build has reached a final state.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout)
     }
 
-    /// Returns true if the build log should be scanned for error patterns.
+    /// Returns true if the build log should be scanned for error-level findings.
     ///
-    /// Only failed and timed-out builds produce actionable findings; succeeded
-    /// and dep-wait builds don't need log analysis.
-    pub fn should_analyze_log(&self) -> bool {
-        matches!(self, Self::Failed | Self::Timeout)
+    /// Only failed builds produce actionable error findings.
+    pub fn should_scan_for_errors(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// Returns true if the build log should be scanned for observations.
+    ///
+    /// Succeeded builds may contain non-fatal compiler warnings worth noting.
+    pub fn should_scan_for_observations(&self) -> bool {
+        matches!(self, Self::Succeeded)
     }
 }
 
@@ -59,6 +65,44 @@ impl std::str::FromStr for BuildStatus {
 }
 
 impl std::fmt::Display for BuildStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Severity of a build finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    /// A finding that contributed to a build failure.
+    Error,
+    /// A finding on a succeeded build — the build completed despite the issue,
+    /// but the issue is worth noting for toolchain analysis.
+    Observation,
+}
+
+impl FindingSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Observation => "observation",
+        }
+    }
+}
+
+impl std::str::FromStr for FindingSeverity {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "error" => Ok(Self::Error),
+            "observation" => Ok(Self::Observation),
+            other => Err(format!("unknown finding severity: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for FindingSeverity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -103,7 +147,6 @@ impl std::fmt::Display for BuilderBackend {
 }
 
 /// A batch is a collection of builds sharing a compiler profile.
-/// Each `build` invocation creates a new batch automatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
     pub id: Uuid,
@@ -134,7 +177,7 @@ pub struct Build {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-/// An error finding from build-log analysis.
+/// An error finding or observation from build-log analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildFinding {
     pub id: Uuid,
@@ -143,6 +186,7 @@ pub struct BuildFinding {
     pub description: String,
     pub excerpt: String,
     pub line_number: Option<i64>,
+    pub severity: FindingSeverity,
 }
 
 /// Result from running a single build (before database insertion).

@@ -1,6 +1,6 @@
 //! Database operations — SQLite storage for batches, builds, and findings.
 
-use crate::models::{BuildStatus, BuilderBackend};
+use crate::models::{BuildStatus, BuilderBackend, FindingSeverity};
 pub use crate::models::{Batch, Build, BuildFinding};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../migrations/001_initial.sql");
+const MIGRATION_002: &str = include_str!("../migrations/002_findings_severity.sql");
 
 /// Aggregate build counts for a batch.
 #[derive(Debug, Default)]
@@ -73,6 +74,23 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
         .execute(&pool)
         .await
         .context("Failed to initialize schema")?;
+
+    // Run incremental migrations idempotently.
+    // ALTER TABLE … ADD COLUMN fails if the column already exists, so we
+    // check first.  This keeps the migration simple without a migrations table.
+    let has_severity: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('build_findings') WHERE name = 'severity'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(false);
+
+    if !has_severity {
+        sqlx::query(MIGRATION_002)
+            .execute(&pool)
+            .await
+            .context("Failed to apply migration 002")?;
+    }
 
     Ok(pool)
 }
@@ -318,12 +336,13 @@ pub async fn insert_finding(
     description: &str,
     excerpt: &str,
     line_number: Option<i64>,
+    severity: FindingSeverity,
 ) -> Result<BuildFinding> {
     let id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO build_findings (id, build_id, category, description, excerpt, line_number)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO build_findings (id, build_id, category, description, excerpt, line_number, severity)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(build_id.to_string())
@@ -331,6 +350,7 @@ pub async fn insert_finding(
     .bind(description)
     .bind(excerpt)
     .bind(line_number)
+    .bind(severity.as_str())
     .execute(pool)
     .await
     .context("Failed to insert finding")?;
@@ -342,6 +362,7 @@ pub async fn insert_finding(
         description: description.to_string(),
         excerpt: excerpt.to_string(),
         line_number,
+        severity,
     })
 }
 
@@ -351,7 +372,7 @@ pub async fn get_findings_for_build(
     build_id: Uuid,
 ) -> Result<Vec<BuildFinding>> {
     sqlx::query(
-        "SELECT id, build_id, category, description, excerpt, line_number
+        "SELECT id, build_id, category, description, excerpt, line_number, severity
          FROM build_findings WHERE build_id = ? ORDER BY line_number",
     )
     .bind(build_id.to_string())
@@ -376,6 +397,7 @@ pub async fn get_finding_count_for_build(pool: &SqlitePool, build_id: Uuid) -> R
 fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
     let id_str: String = row.get("id");
     let build_id_str: String = row.get("build_id");
+    let severity_str: String = row.get("severity");
 
     Ok(BuildFinding {
         id: Uuid::parse_str(&id_str)?,
@@ -384,6 +406,9 @@ fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
         description: row.get("description"),
         excerpt: row.get("excerpt"),
         line_number: row.get("line_number"),
+        severity: severity_str
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?,
     })
 }
 

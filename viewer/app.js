@@ -128,11 +128,17 @@ function loadBatchData(batchId) {
     ).forEach(function(r) { countMap[r.build_id] = Number(r.count); });
 
     var summaryRows = dbQuery(
-        "SELECT bf.category, COUNT(*) AS count " +
+        "SELECT bf.category, bf.severity, COUNT(*) AS count " +
         "FROM build_findings bf JOIN builds b ON bf.build_id = b.id " +
-        "WHERE b.batch_id = ? GROUP BY bf.category ORDER BY count DESC",
+        "WHERE b.batch_id = ? GROUP BY bf.category, bf.severity ORDER BY bf.severity, count DESC",
         [batchId]
     );
+    var errors = [], observations = [];
+    summaryRows.forEach(function(r) {
+        var item = { category: r.category, count: Number(r.count) };
+        if (r.severity === 'observation') observations.push(item);
+        else errors.push(item);
+    });
     return {
         builds: buildRows.map(function(row) {
             return {
@@ -141,7 +147,8 @@ function loadBatchData(batchId) {
                 peak_memory_mb: row.peak_memory_mb, finding_count: countMap[row.id] || 0
             };
         }),
-        finding_summary: summaryRows.map(function(r) { return { category: r.category, count: Number(r.count) }; })
+        finding_summary: errors,
+        observation_summary: observations
     };
 }
 
@@ -344,31 +351,49 @@ function renderDetailsStatusBar() {
 function renderDetailsFindings() {
     var fc = el('findings-content');
     if (!fc) return;
-    var findings = (currentBatchData && currentBatchData.finding_summary) || [];
+    var errors = (currentBatchData && currentBatchData.finding_summary) || [];
+    var observations = (currentBatchData && currentBatchData.observation_summary) || [];
     var unanalyzed = 0;
     if (currentBatchData) {
         currentBatchData.builds.forEach(function(bld) {
             if (bld.status !== 'succeeded' && !bld.finding_count) unanalyzed++;
         });
     }
-    if (findings.length === 0 && unanalyzed === 0) {
+    if (errors.length === 0 && observations.length === 0 && unanalyzed === 0) {
         fc.innerHTML = '<p class="muted">No issues in this batch.</p>';
         return;
     }
-    var total = 0;
-    findings.forEach(function(f) { total += f.count; });
-    var html = '<p class="muted" style="margin-bottom:4px">' + total + ' issues</p>';
-    findings.forEach(function(f) {
-        html += '<div class="findings-bar-item">' +
-            '<span class="findings-bar-count">' + f.count + '</span>' +
-            '<span class="findings-bar-label" title="' + escapeAttr(f.category) + '">' + escapeHtml(f.category) + '</span>' +
-            '</div>';
-    });
-    if (unanalyzed > 0) {
-        html += '<div class="findings-bar-item findings-bar-unanalyzed">' +
-            '<span class="findings-bar-count">' + unanalyzed + '</span>' +
-            '<span class="findings-bar-label">Unanalyzed</span></div>';
+    var html = '';
+
+    // Error findings (from failed builds)
+    if (errors.length > 0 || unanalyzed > 0) {
+        var errorTotal = 0;
+        errors.forEach(function(f) { errorTotal += f.count; });
+        html += '<p class="findings-section-label findings-label-error">Errors</p>';
+        errors.forEach(function(f) {
+            html += '<div class="findings-bar-item">' +
+                '<span class="findings-bar-count">' + f.count + '</span>' +
+                '<span class="findings-bar-label" title="' + escapeAttr(f.category) + '">' + escapeHtml(f.category) + '</span>' +
+                '</div>';
+        });
+        if (unanalyzed > 0) {
+            html += '<div class="findings-bar-item findings-bar-unanalyzed">' +
+                '<span class="findings-bar-count">' + unanalyzed + '</span>' +
+                '<span class="findings-bar-label">Unanalyzed (no patterns matched)</span></div>';
+        }
     }
+
+    // Observation findings (from succeeded builds)
+    if (observations.length > 0) {
+        html += '<p class="findings-section-label findings-label-observation" style="margin-top:6px">Observations</p>';
+        observations.forEach(function(f) {
+            html += '<div class="findings-bar-item findings-bar-observation">' +
+                '<span class="findings-bar-count">' + f.count + '</span>' +
+                '<span class="findings-bar-label" title="' + escapeAttr(f.category) + '">' + escapeHtml(f.category) + '</span>' +
+                '</div>';
+        });
+    }
+
     fc.innerHTML = html;
 }
 
@@ -900,7 +925,8 @@ function closeLogModal() { var m = el('log-modal'); if (m) m.classList.add('hidd
 
 function showBuildDetails(buildId) {
     var findings = dbQuery(
-        "SELECT category, description, excerpt, line_number FROM build_findings WHERE build_id = ? ORDER BY line_number",
+        "SELECT category, description, excerpt, line_number, severity " +
+        "FROM build_findings WHERE build_id = ? ORDER BY severity, line_number",
         [buildId]
     );
     var pkg = '';
@@ -913,12 +939,31 @@ function showBuildDetails(buildId) {
     if (findings.length === 0) {
         if (mb) mb.innerHTML = '<p class="muted">No findings.</p>';
     } else {
-        if (mb) mb.innerHTML = findings.map(function(f) {
-            return '<div class="finding-detail"><h4>' + escapeHtml(f.category) + '</h4>' +
-                '<p>' + escapeHtml(f.description) + '</p>' +
-                (f.line_number ? '<p class="muted">Line ' + f.line_number + '</p>' : '') +
-                '<pre>' + escapeHtml(f.excerpt) + '</pre></div>';
-        }).join('');
+        var errors = findings.filter(function(f) { return f.severity !== 'observation'; });
+        var obs    = findings.filter(function(f) { return f.severity === 'observation'; });
+        var html = '';
+        if (errors.length > 0) {
+            html += errors.map(function(f) {
+                return '<div class="finding-detail finding-detail-error">' +
+                    '<h4>' + escapeHtml(f.category) + '</h4>' +
+                    '<p>' + escapeHtml(f.description) + '</p>' +
+                    (f.line_number ? '<p class="muted">Line ' + f.line_number + '</p>' : '') +
+                    (f.excerpt ? '<pre>' + escapeHtml(f.excerpt) + '</pre>' : '') +
+                    '</div>';
+            }).join('');
+        }
+        if (obs.length > 0) {
+            html += '<h4 class="finding-group-label">Observations</h4>';
+            html += obs.map(function(f) {
+                return '<div class="finding-detail finding-detail-observation">' +
+                    '<h4>' + escapeHtml(f.category) + '</h4>' +
+                    '<p>' + escapeHtml(f.description) + '</p>' +
+                    (f.line_number ? '<p class="muted">Line ' + f.line_number + '</p>' : '') +
+                    (f.excerpt ? '<pre>' + escapeHtml(f.excerpt) + '</pre>' : '') +
+                    '</div>';
+            }).join('');
+        }
+        if (mb) mb.innerHTML = html;
     }
     var m = el('modal');
     if (m) { m.classList.remove('hidden'); document.body.style.overflow = 'hidden'; }
@@ -927,21 +972,40 @@ function showBuildDetails(buildId) {
 var currentLogText = '';
 
 async function showBuildLog(buildId, packageName) {
+    var lt = el('log-modal-title');
+    var lm = el('log-modal');
+    var ls = el('log-search');
+    var lsc = el('log-search-count');
+    var lc = el('log-content');
+
+    // Show the modal immediately so the user gets feedback.
+    if (lt) lt.textContent = packageName + ' — Build Log';
+    if (ls) ls.value = '';
+    if (lsc) lsc.textContent = '';
+    if (lc) lc.innerHTML = '<div class="log-loading">Loading\u2026</div>';
+    if (lm) { lm.classList.remove('hidden'); document.body.style.overflow = 'hidden'; }
+
     try {
         var r = await fetch(DATA_BASE_URL + '/logs/' + buildId + '.log');
-        if (!r.ok) throw new Error('Log not found');
+        if (r.status === 404) {
+            if (lc) lc.innerHTML =
+                '<div class="log-unavailable">' +
+                '<p>Log not available.</p>' +
+                '<p>This viewer is running without build logs. Logs are only present ' +
+                'when the viewer data was exported from the machine that ran the builds.</p>' +
+                '</div>';
+            return;
+        }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         currentLogText = await r.text();
-        var lt = el('log-modal-title');
-        if (lt) lt.textContent = packageName + ' — Build Log';
-        var ls = el('log-search');
-        if (ls) { ls.value = ''; }
-        var lsc = el('log-search-count');
-        if (lsc) lsc.textContent = '';
         renderLog(currentLogText);
-        var lm = el('log-modal');
-        if (lm) { lm.classList.remove('hidden'); document.body.style.overflow = 'hidden'; }
         setTimeout(function() { if (ls) ls.focus(); }, 100);
-    } catch(err) { console.error('Log load failed:', err); }
+    } catch(err) {
+        if (lc) lc.innerHTML =
+            '<div class="log-unavailable">' +
+            '<p>Failed to load log: ' + escapeHtml(String(err.message || err)) + '</p>' +
+            '</div>';
+    }
 }
 
 function renderLog(text, searchTerm) {

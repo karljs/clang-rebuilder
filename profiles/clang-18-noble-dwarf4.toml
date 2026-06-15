@@ -1,0 +1,20 @@
+# Clang 18 on Noble with -gdwarf-4 workaround.
+# Noble's dwz 0.15 does not fully support DWARF5 output from Clang.
+# This flag forces DWARF4 output, which dwz can process correctly.
+
+[compiler]
+type = "clang"
+version = "18"
+
+[target]
+series = "noble"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Noble's dwz 0.15 does not fully support DWARF5 output from Clang 18"
+
+[[flags]]
+var = "DEB_CXXFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Noble's dwz 0.15 does not fully support DWARF5 output from Clang 18"

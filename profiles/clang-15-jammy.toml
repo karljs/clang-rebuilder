@@ -1,9 +1,9 @@
-# Clang 20 on Noble — standard profile, no extra flags.
+# Clang 15 on Jammy — standard profile, no extra flags.
 # Use this to measure the baseline drop-in replacement gap between GCC and Clang.
 
 [compiler]
 type = "clang"
-version = "20"
+version = "15"
 
 [target]
-series = "noble"
+series = "jammy"

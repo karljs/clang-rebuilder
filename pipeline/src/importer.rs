@@ -165,9 +165,9 @@ async fn import_single_log(
         "Imported build"
     );
 
-    // Scan log for error patterns if build failed
-    if status.should_analyze_log() {
-        let findings = scan_log(&log_content);
+    // Scan log for error patterns on failed builds, observations on succeeded builds.
+    if status.should_scan_for_errors() || status.should_scan_for_observations() {
+        let findings = scan_log(&log_content, status);
         for finding in findings {
             db::insert_finding(
                 pool,
@@ -176,6 +176,7 @@ async fn import_single_log(
                 &finding.description,
                 &finding.excerpt,
                 Some(finding.line_number as i64),
+                finding.severity,
             )
             .await?;
         }
