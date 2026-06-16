@@ -1,24 +1,23 @@
 # Ubuntu Archive Rebuilder
 
-A tool to rebuild packages from the Ubuntu archive with alternative compilers
-(initially Clang, but designed to be broadly useful for any compiler evaluation).
-It supports adjusting the build environment with global flag overrides — for
-example, forcing DWARF4 debug info for toolchains whose output `dwz` cannot
-yet process.
+A tool to rebuild packages from the Ubuntu archive with the option to
+swap out the default `gcc`-based C and C++ toolchain for arbitrary
+versions of `clang`.
 
-For each package in a batch the backend will:
+For each package in a user-defined batch, the builder will:
 
 1. Fetch the source from the Ubuntu archive via `pull-lp-source`.
 2. Run `sbuild --chroot-mode=unshare` with the profile's compiler and flags.
-3. For `clang` profiles, install the target version inside the build environment
-   and replace `/usr/bin/gcc` (and `g++`, `cpp`) with a wrapper script that execs
-   Clang. A verification step confirms `gcc --version` reports Clang before the
-   build starts. This is intentionally direct, because packages can invoke gcc in
-   a number of unexpected ways.
+3. For `clang` profiles, install the target version inside the build
+   environment and replace `/usr/bin/gcc` (and `g++`, `cpp`) with a
+   wrapper script that execs `clang`. A verification step confirms
+   `gcc --version` reports `clang` before the build starts. This is
+   intentionally brutish, because packages can invoke `gcc` in a number
+   of unexpected ways.
 4. Scan build logs for known error patterns, recording structured findings.
 5. Store results in a local SQLite database.
 
-A static frontend is included for browsing and analysing results.
+A static frontend is included for browsing and analyzing results.
 
 
 ## Setup
@@ -68,11 +67,11 @@ flag = "-gdwarf-4"
 reason = "Noble's dwz 0.15 doesn't support DWARF5"
 ```
 
-Each `[[flags]]` entry includes a `reason` field to track why the workaround
-exists. Profiles are snapshotted into the database at build time, so results
-are always tied to the exact configuration used.
-
+Each `[[flags]]` entry includes a `reason` field to track why the
+workaround exists. Profiles are snapshotted into the database at build
+time.
 
 ## Package list format
 
-One source package name per line; blank lines and `#` comments are ignored.
+One source package name per line; blank lines and `#` comments are
+ignored. Several small sets are provided, useful for testing.
