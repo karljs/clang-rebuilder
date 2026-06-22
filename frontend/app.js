@@ -164,7 +164,7 @@ function loadBatchData(batchId) {
     });
 
     var summaryRows = dbQuery(
-        "SELECT bf.category, bf.severity, bf.finding_class, COUNT(*) AS count " +
+        "SELECT bf.category, bf.severity, bf.finding_class, COUNT(DISTINCT bf.build_id) AS count " +
         "FROM build_findings bf JOIN builds b ON bf.build_id = b.id " +
         "WHERE b.batch_id = ? GROUP BY bf.category, bf.severity, bf.finding_class ORDER BY bf.severity, count DESC",
         [batchId]
@@ -347,11 +347,11 @@ function populateDetailsBatchSelector() {
     setDropdownOptions('details-batch-dd', opts);
 }
 
-function loadDetailsForBatch(batchId, pushHistory) {
+function loadDetailsForBatch(batchId, pushHistory, preserveFilter) {
     currentBatch = batches.find(function(b) { return b.id === batchId; });
     if (!currentBatch) return;
     currentBatchData = loadBatchData(batchId);
-    categoryFilter = null;  // reset category filter when switching batches
+    if (!preserveFilter) categoryFilter = null;  // reset category filter when switching batches
 
     // Update selector to reflect current batch.
     setDropdownValue('details-batch-dd', batchId);
@@ -424,10 +424,12 @@ function renderDetailsFindings() {
     // severity/class colour; `filterValue` is what renderBuildsTable matches on.
     function bar(label, count, filterValue, extraCls, titleText) {
         var active = categoryFilter === filterValue;
+        var pkgWord = count === 1 ? 'package' : 'packages';
+        var defaultTitle = count + ' ' + pkgWord + ' affected — click to filter by ' + label;
         return '<div class="findings-bar-item findings-bar-clickable' + (extraCls ? ' ' + extraCls : '') +
             (active ? ' findings-bar-active' : '') + '" ' +
             'data-action="filter-category" data-cat="' + escapeAttr(filterValue) + '" ' +
-            'title="' + escapeAttr(titleText || ('Filter packages with ' + label)) + '">' +
+            'title="' + escapeAttr(titleText || defaultTitle) + '">' +
             '<span class="findings-bar-count">' + count + '</span>' +
             '<span class="findings-bar-label">' + escapeHtml(label) + '</span>' +
             (active ? '<span class="findings-bar-x" title="Clear filter">×</span>' : '') +
@@ -446,8 +448,9 @@ function renderDetailsFindings() {
             html += bar(f.category, f.count, f.category, null);
         });
         if (unanalyzed > 0) {
+            var uWord = unanalyzed === 1 ? 'package' : 'packages';
             html += bar('Unanalyzed (no patterns matched)', unanalyzed, '__unanalyzed__',
-                'findings-bar-unanalyzed', 'Filter failed builds with no matched pattern');
+                'findings-bar-unanalyzed', unanalyzed + ' ' + uWord + ' failed with no matched pattern — click to filter');
         }
 
         if (envErrors.length > 0) {
@@ -705,14 +708,25 @@ function renderBuildsTable() {
 }
 
 // Set (or toggle off) the Issue-Category filter and re-render.
+// Activating a filter pushes a history entry so the back button can clear it;
+// clearing a filter replaces the current entry (no extra back step needed).
 function setCategoryFilter(cat) {
-    categoryFilter = (categoryFilter === cat) ? null : cat;
+    var next = (categoryFilter === cat) ? null : cat;
+    var batchId = currentBatch ? currentBatch.id : null;
+    if (next !== null) {
+        history.pushState({ tab: 'details', batchId: batchId, categoryFilter: next }, '');
+    } else {
+        history.replaceState({ tab: 'details', batchId: batchId, categoryFilter: null }, '');
+    }
+    categoryFilter = next;
     renderDetailsFindings();
     renderBuildsTable();
 }
 
 function clearCategoryFilter() {
     if (categoryFilter === null) return;
+    var batchId = currentBatch ? currentBatch.id : null;
+    history.replaceState({ tab: 'details', batchId: batchId, categoryFilter: null }, '');
     categoryFilter = null;
     renderDetailsFindings();
     renderBuildsTable();
@@ -1195,7 +1209,10 @@ window.addEventListener('popstate', function(e) {
     var tab = e.state.tab || 'overview';
     switchTab(tab, false);
     if (tab === 'details' && e.state.batchId) {
-        loadDetailsForBatch(e.state.batchId, false);
+        // Restore the category filter from history state before loading the batch,
+        // so loadDetailsForBatch does not clobber it.
+        categoryFilter = e.state.categoryFilter || null;
+        loadDetailsForBatch(e.state.batchId, false, true);
     }
     if (tab === 'compare' && e.state.compareIds) {
         compareSelectedIds = e.state.compareIds.slice();
