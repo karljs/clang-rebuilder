@@ -8,6 +8,7 @@ pub mod analyzer;
 pub mod builder;
 pub mod db;
 pub mod export;
+pub mod fetcher;
 pub mod importer;
 pub mod models;
 pub mod profile;

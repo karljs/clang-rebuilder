@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rebuilder::{builder, db, export, profile::Profile};
+use rebuilder::{builder, db, export, fetcher, profile::Profile};
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -86,6 +86,44 @@ enum Commands {
         /// Re-scan every build in the database.
         #[arg(long)]
         all: bool,
+    },
+
+    /// Fetch a list of source packages from the Ubuntu archive.
+    ///
+    /// Downloads and parses the Sources.gz index for the given series and
+    /// components, filters by target architecture, and writes a package list
+    /// file ready to pass to `rebuilder build --packages`.
+    ///
+    /// Example:
+    ///   rebuilder fetch-packages --series noble --output packages-noble.txt
+    ///   rebuilder fetch-packages --series noble --components main,universe \
+    ///       --arch arm64 --output packages-noble-arm64.txt
+    FetchPackages {
+        /// Ubuntu series to fetch packages for (e.g. noble, jammy).
+        #[arg(long)]
+        series: String,
+
+        /// Archive components to include, comma-separated.
+        #[arg(long, default_value = "main", value_delimiter = ',')]
+        components: Vec<String>,
+
+        /// Target build architecture.  Packages that cannot build on this
+        /// architecture are excluded.  Defaults to amd64.
+        ///
+        /// Also controls the default mirror: amd64 and i386 use
+        /// archive.ubuntu.com; all other architectures use
+        /// ports.ubuntu.com.  Override with --url if needed.
+        #[arg(long, default_value = "amd64")]
+        arch: String,
+
+        /// Override the archive mirror base URL.  Defaults to the standard
+        /// mirror for the chosen architecture.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Output file to write package names to.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -274,6 +312,63 @@ async fn main() -> Result<()> {
             println!("  Builds skipped (no log): {skipped}");
             println!("  Findings before: {findings_before}");
             println!("  Findings after:  {findings_after}");
+        }
+
+        Commands::FetchPackages {
+            series,
+            components,
+            arch,
+            url,
+            output,
+        } => {
+            let mirror = url.unwrap_or_else(|| {
+                fetcher::default_mirror_for_arch(&arch).to_string()
+            });
+
+            // ureq is synchronous; run it off the async executor.
+            let series2 = series.clone();
+            let arch2 = arch.clone();
+            let mirror2 = mirror.clone();
+            let components2 = components.clone();
+            let packages = tokio::task::spawn_blocking(move || {
+                let components_ref: Vec<&str> = components2.iter().map(String::as_str).collect();
+                fetcher::fetch_package_list(&series2, &components_ref, &arch2, &mirror2)
+            })
+            .await
+            .context("fetch task panicked")??;
+
+            // Build per-component counts for the summary.
+            let mut comp_counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for (_, comp) in &packages {
+                *comp_counts.entry(comp.as_str()).or_default() += 1;
+            }
+
+            // Write output file with a comment header.
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+            let comp_str = components.join(", ");
+            let mut lines = Vec::with_capacity(packages.len() + 8);
+            lines.push(format!("# Ubuntu source package list"));
+            lines.push(format!("# Series:     {series}"));
+            lines.push(format!("# Components: {comp_str}"));
+            lines.push(format!("# Arch:       {arch}"));
+            lines.push(format!("# Mirror:     {mirror}"));
+            lines.push(format!("# Generated:  {now}"));
+            lines.push(format!("# Total:      {}", packages.len()));
+            lines.push(String::new());
+            for (pkg, _comp) in &packages {
+                lines.push(pkg.clone());
+            }
+            lines.push(String::new()); // trailing newline
+
+            std::fs::write(&output, lines.join("\n"))
+                .with_context(|| format!("Failed to write {}", output.display()))?;
+
+            println!("Fetched {} source packages:", packages.len());
+            for (comp, count) in &comp_counts {
+                println!("  {comp}: {count}");
+            }
+            println!("Written to {}", output.display());
         }
     }
 

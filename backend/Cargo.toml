@@ -23,6 +23,10 @@ toml = "0.8"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# HTTP + decompression (used by fetch-packages subcommand)
+ureq = "2"
+flate2 = "1"
+
 # Utilities
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
