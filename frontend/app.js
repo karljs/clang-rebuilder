@@ -10,6 +10,7 @@ let sortColumn = 'package';
 let sortDirection = 'asc';
 let currentBatch = null;   // batch object currently shown in Details
 let currentBatchData = null; // { builds, finding_summary }
+let categoryFilter = null;  // active Issue-Category filter on the Details builds table
 
 // profile_configs lookup: profile_name -> { flag_summary, flags_json, has_flags }
 var profileConfigMap = {};
@@ -77,7 +78,7 @@ function loadData() {
     );
     var statsMap = {};
     statRows.forEach(function(r) {
-        if (!statsMap[r.batch_id]) statsMap[r.batch_id] = { total:0, succeeded:0, failed:0, dep_wait:0, timeout:0 };
+        if (!statsMap[r.batch_id]) statsMap[r.batch_id] = { total:0, succeeded:0, failed:0, dep_wait:0, timeout:0, environmental:0 };
         var s = statsMap[r.batch_id], n = Number(r.count);
         s.total += n;
         if (r.status === 'succeeded') s.succeeded = n;
@@ -85,6 +86,28 @@ function loadData() {
         else if (r.status === 'dep_wait') s.dep_wait = n;
         else if (r.status === 'timeout')  s.timeout  = n;
     });
+
+    // Environmental-only failures: failed builds whose findings are ALL
+    // environmental (e.g. parallel-install race). These are infrastructure
+    // artifacts, not toolchain failures, so we split them out of `failed` and
+    // exclude them from success-rate denominators.
+    try {
+        dbQuery(
+            "SELECT b.batch_id, COUNT(*) AS count FROM builds b " +
+            "WHERE b.status = 'failed' " +
+            "AND EXISTS (SELECT 1 FROM build_findings f WHERE f.build_id = b.id) " +
+            "AND NOT EXISTS (SELECT 1 FROM build_findings f WHERE f.build_id = b.id AND f.finding_class <> 'environmental') " +
+            "GROUP BY b.batch_id"
+        ).forEach(function(r) {
+            var s = statsMap[r.batch_id];
+            if (!s) return;
+            var n = Number(r.count);
+            s.environmental = n;
+            s.failed = Math.max(0, s.failed - n);
+        });
+    } catch(e) {
+        console.warn('finding_class not present — re-run: rebuilder export');
+    }
 
     batches = dbQuery(
         "SELECT id, name, compiler_type, compiler_version, series, profile_name, started_at, finished_at " +
@@ -99,7 +122,7 @@ function loadData() {
             profile_name: row.profile_name,
             started_at: row.started_at,
             finished_at: row.finished_at,
-            stats: statsMap[row.id] || { total:0, succeeded:0, failed:0, dep_wait:0, timeout:0 }
+            stats: statsMap[row.id] || { total:0, succeeded:0, failed:0, dep_wait:0, timeout:0, environmental:0 }
         };
         b.config = configFor(b);
         return b;
@@ -122,31 +145,50 @@ function loadBatchData(batchId) {
         "FROM builds WHERE batch_id = ? ORDER BY source_package",
         [batchId]
     );
-    var countMap = {};
+
+    // Per-build findings: distinct categories, distinct classes, and a flag for
+    // "all findings are environmental" so the table can highlight infra-only
+    // failures distinctly from genuine toolchain failures.
+    var findingMap = {}; // build_id -> { categories:Set, classes:Set, count }
     dbQuery(
-        "SELECT build_id, COUNT(*) AS count FROM build_findings " +
-        "WHERE build_id IN (SELECT id FROM builds WHERE batch_id = ?) GROUP BY build_id",
+        "SELECT bf.build_id, bf.category, bf.finding_class, bf.severity " +
+        "FROM build_findings bf JOIN builds b ON bf.build_id = b.id " +
+        "WHERE b.batch_id = ?",
         [batchId]
-    ).forEach(function(r) { countMap[r.build_id] = Number(r.count); });
+    ).forEach(function(r) {
+        var m = findingMap[r.build_id];
+        if (!m) { m = findingMap[r.build_id] = { categories: {}, classes: {}, count: 0 }; }
+        m.categories[r.category] = true;
+        m.classes[r.finding_class] = true;
+        m.count++;
+    });
 
     var summaryRows = dbQuery(
-        "SELECT bf.category, bf.severity, COUNT(*) AS count " +
+        "SELECT bf.category, bf.severity, bf.finding_class, COUNT(*) AS count " +
         "FROM build_findings bf JOIN builds b ON bf.build_id = b.id " +
-        "WHERE b.batch_id = ? GROUP BY bf.category, bf.severity ORDER BY bf.severity, count DESC",
+        "WHERE b.batch_id = ? GROUP BY bf.category, bf.severity, bf.finding_class ORDER BY bf.severity, count DESC",
         [batchId]
     );
     var errors = [], observations = [];
     summaryRows.forEach(function(r) {
-        var item = { category: r.category, count: Number(r.count) };
+        var item = { category: r.category, count: Number(r.count), finding_class: r.finding_class };
         if (r.severity === 'observation') observations.push(item);
         else errors.push(item);
     });
     return {
         builds: buildRows.map(function(row) {
+            var m = findingMap[row.id];
+            var categories = m ? Object.keys(m.categories) : [];
+            var classes = m ? Object.keys(m.classes) : [];
+            // Environmental-only: has findings and none are toolchain/non-env.
+            var envOnly = classes.length > 0 && classes.every(function(c) { return c === 'environmental'; });
             return {
                 id: row.id, package: row.package, version: row.version,
                 status: row.status, duration_seconds: row.duration_seconds,
-                peak_memory_mb: row.peak_memory_mb, finding_count: countMap[row.id] || 0
+                peak_memory_mb: row.peak_memory_mb,
+                finding_count: m ? m.count : 0,
+                categories: categories,
+                env_only: envOnly
             };
         }),
         finding_summary: errors,
@@ -262,19 +304,20 @@ function renderOverview() {
 
             var rowsHtml = profiles.map(function(b) {
                 var s = b.stats;
-                var rate = s.total > 0 ? (s.succeeded / s.total) * 100 : 0;
-                var lowN = s.total < 50;
+                var rate = successRate(s);
+                var lowN = comparableTotal(s) < 50;
                 var colorCls = rateColorClass(rate);
                 var flags = parseFlagsJson(b.config.flags_json);
                 var flagDetail = flags.length === 0 ? 'No extra flags'
                     : flags.map(function(f) { return f.flag + ' — ' + f.reason; }).join('\n');
-                var title = b.profile_name + '\n' + s.succeeded + '/' + s.total + ' succeeded\n' + flagDetail;
+                var envNote = s.environmental > 0 ? '\n' + s.environmental + ' environmental (excluded)' : '';
+                var title = b.profile_name + '\n' + s.succeeded + '/' + comparableTotal(s) + ' succeeded' + envNote + '\n' + flagDetail;
 
                 return '<tr class="matrix-profile-row ' + colorCls + (lowN ? ' low-n' : '') + '" ' +
                        'data-action="go-details" data-id="' + escapeAttr(b.id) + '" title="' + escapeAttr(title) + '">' +
                        '<td class="mpr-label">' + escapeHtml(b.config.flag_summary) + '</td>' +
                        '<td class="mpr-rate">' + rate.toFixed(1) + '%</td>' +
-                       '<td class="mpr-n">' + (lowN ? '⚠ ' : '') + 'N=' + s.total + '</td>' +
+                       '<td class="mpr-n">' + (lowN ? '⚠ ' : '') + 'N=' + comparableTotal(s) + (s.environmental > 0 ? '<span class="mpr-env" title="' + s.environmental + ' environmental failures excluded">*</span>' : '') + '</td>' +
                        '</tr>';
             }).join('');
 
@@ -295,10 +338,10 @@ function renderOverview() {
 
 function populateDetailsBatchSelector() {
     var opts = batches.map(function(b) {
-        var rate = b.stats.total > 0 ? Math.round(b.stats.succeeded / b.stats.total * 100) : 0;
+        var rate = Math.round(successRate(b.stats));
         return {
             value: b.id,
-            label: b.profile_name + ' · ' + b.series + '  (' + rate + '%, N=' + b.stats.total + ')'
+            label: b.profile_name + ' · ' + b.series + '  (' + rate + '%, N=' + comparableTotal(b.stats) + ')'
         };
     });
     setDropdownOptions('details-batch-dd', opts);
@@ -308,6 +351,7 @@ function loadDetailsForBatch(batchId, pushHistory) {
     currentBatch = batches.find(function(b) { return b.id === batchId; });
     if (!currentBatch) return;
     currentBatchData = loadBatchData(batchId);
+    categoryFilter = null;  // reset category filter when switching batches
 
     // Update selector to reflect current batch.
     setDropdownValue('details-batch-dd', batchId);
@@ -340,7 +384,7 @@ function renderDetailsStatusBar() {
     var b = currentBatch;
     if (!b) return;
     var s = b.stats;
-    var rate = s.total > 0 ? ((s.succeeded / s.total) * 100).toFixed(0) : 0;
+    var rate = comparableTotal(s) > 0 ? successRate(s).toFixed(0) : 0;
     var started = new Date(b.started_at).toLocaleString();
     var totalSecs = 0;
     if (currentBatchData) {
@@ -351,12 +395,13 @@ function renderDetailsStatusBar() {
     sb.innerHTML =
         '<span class="s-pass">' + s.succeeded + ' passed</span>' +
         '<span class="s-fail">' + s.failed + ' failed</span>' +
+        (s.environmental > 0 ? '<span class="s-env" title="Environmental/infrastructure failures, excluded from the success rate">' + s.environmental + ' environmental</span>' : '') +
         (s.timeout  > 0 ? '<span class="s-timeout">' + s.timeout  + ' timeout</span>' : '') +
         (s.dep_wait > 0 ? '<span class="s-depwait">' + s.dep_wait + ' dep-wait</span>' : '') +
         '<span>' + s.total + ' total</span>' +
-        '<span><span class="rate-bar"><span class="rate-fill" style="width:' + rate + '%"></span></span> ' + rate + '%</span>' +
+        '<span><span class="rate-bar"><span class="rate-fill" style="width:' + rate + '%"></span></span> ' + rate + '%' + (s.environmental > 0 ? ' <span class="muted">(excl. environmental)</span>' : '') + '</span>' +
         '<span>' + fmtDuration(totalSecs) + ' total build time</span>' +
-        '<span class="batch-meta">' + escapeHtml(b.compiler_type + ' ' + b.compiler_version + ' · ' + b.series + ' · ' + started) + '</span>';
+        '<span class="batch-meta">' + escapeHtml(started) + '</span>';
 }
 
 function renderDetailsFindings() {
@@ -374,23 +419,43 @@ function renderDetailsFindings() {
         fc.innerHTML = '<p class="muted">No issues in this batch.</p>';
         return;
     }
+
+    // A clickable category bar that filters the builds table. `extraCls` adds a
+    // severity/class colour; `filterValue` is what renderBuildsTable matches on.
+    function bar(label, count, filterValue, extraCls, titleText) {
+        var active = categoryFilter === filterValue;
+        return '<div class="findings-bar-item findings-bar-clickable' + (extraCls ? ' ' + extraCls : '') +
+            (active ? ' findings-bar-active' : '') + '" ' +
+            'data-action="filter-category" data-cat="' + escapeAttr(filterValue) + '" ' +
+            'title="' + escapeAttr(titleText || ('Filter packages with ' + label)) + '">' +
+            '<span class="findings-bar-count">' + count + '</span>' +
+            '<span class="findings-bar-label">' + escapeHtml(label) + '</span>' +
+            (active ? '<span class="findings-bar-x" title="Clear filter">×</span>' : '') +
+            '</div>';
+    }
+
     var html = '';
 
-    // Error findings (from failed builds)
+    // Error findings (from failed builds) — split toolchain vs environmental.
     if (errors.length > 0 || unanalyzed > 0) {
-        var errorTotal = 0;
-        errors.forEach(function(f) { errorTotal += f.count; });
-        html += '<p class="findings-section-label findings-label-error">Errors</p>';
-        errors.forEach(function(f) {
-            html += '<div class="findings-bar-item">' +
-                '<span class="findings-bar-count">' + f.count + '</span>' +
-                '<span class="findings-bar-label" title="' + escapeAttr(f.category) + '">' + escapeHtml(f.category) + '</span>' +
-                '</div>';
+        var toolchainErrors = errors.filter(function(f) { return f.finding_class !== 'environmental'; });
+        var envErrors = errors.filter(function(f) { return f.finding_class === 'environmental'; });
+
+        html += '<p class="findings-section-label findings-label-error">Errors (toolchain)</p>';
+        toolchainErrors.forEach(function(f) {
+            html += bar(f.category, f.count, f.category, null);
         });
         if (unanalyzed > 0) {
-            html += '<div class="findings-bar-item findings-bar-unanalyzed">' +
-                '<span class="findings-bar-count">' + unanalyzed + '</span>' +
-                '<span class="findings-bar-label">Unanalyzed (no patterns matched)</span></div>';
+            html += bar('Unanalyzed (no patterns matched)', unanalyzed, '__unanalyzed__',
+                'findings-bar-unanalyzed', 'Filter failed builds with no matched pattern');
+        }
+
+        if (envErrors.length > 0) {
+            html += '<p class="findings-section-label findings-label-environmental" style="margin-top:6px" ' +
+                'title="Infrastructure/environmental artifacts, excluded from the success rate">Environmental (excluded from rate)</p>';
+            envErrors.forEach(function(f) {
+                html += bar(f.category, f.count, f.category, 'findings-bar-environmental');
+            });
         }
     }
 
@@ -398,10 +463,7 @@ function renderDetailsFindings() {
     if (observations.length > 0) {
         html += '<p class="findings-section-label findings-label-observation" style="margin-top:6px">Observations</p>';
         observations.forEach(function(f) {
-            html += '<div class="findings-bar-item findings-bar-observation">' +
-                '<span class="findings-bar-count">' + f.count + '</span>' +
-                '<span class="findings-bar-label" title="' + escapeAttr(f.category) + '">' + escapeHtml(f.category) + '</span>' +
-                '</div>';
+            html += bar(f.category, f.count, f.category, 'findings-bar-observation');
         });
     }
 
@@ -453,7 +515,7 @@ function renderProfileComparison() {
         '</tr></thead><tbody>';
     profiles.forEach(function(p) {
         var s = p.stats;
-        var rate = s.total > 0 ? (s.succeeded / s.total * 100).toFixed(1) : '—';
+        var rate = comparableTotal(s) > 0 ? successRate(s).toFixed(1) : '—';
         var flags = parseFlagsJson(p.config.flags_json);
         var flagCells = flags.length === 0 ? '<span class="muted">none</span>'
             : unique(flags.map(function(f) { return f.flag; })).map(function(f) {
@@ -469,7 +531,7 @@ function renderProfileComparison() {
          html += '<tr' + rowAttrs + '>' +
             '<td>' + escapeHtml(p.config.flag_summary) + (isCurrent ? ' <span class="muted">(current)</span>' : '') + '</td>' +
             '<td>' + flagCells + '</td>' +
-            '<td class="num mono">' + s.total + '</td>' +
+            '<td class="num mono">' + comparableTotal(s) + (s.environmental > 0 ? '<span class="mpr-env" title="' + s.environmental + ' environmental failures excluded">*</span>' : '') + '</td>' +
             '<td class="num mono s-pass">' + s.succeeded + '</td>' +
             '<td class="num mono s-fail">' + s.failed + (s.timeout ? '+' + s.timeout + 't' : '') + '</td>' +
             '<td class="num mono">' + rate + '%</td>' +
@@ -532,14 +594,14 @@ function renderVersionContext() {
     versions.forEach(function(v) {
         var bv = verMap[v];
         var s = bv.stats;
-        var rate = s.total > 0 ? (s.succeeded / s.total * 100) : 0;
-        var lowN = s.total < 50;
+        var rate = successRate(s);
+        var lowN = comparableTotal(s) < 50;
         var isCurrent = bv.id === b.id;
         html += '<tr class="ver-row' + (isCurrent ? ' details-current-row' : '') + '"' +
             ' data-action="go-details" data-id="' + escapeAttr(bv.id) + '"' +
             ' title="Open ' + escapeAttr(bv.profile_name) + ' in Details">' +
             '<td class="mono">' + escapeHtml(v) + (isCurrent ? ' <span class="muted">(current)</span>' : '') + '</td>' +
-            '<td class="num mono">' + (lowN ? '⚠ ' : '') + s.total + '</td>' +
+            '<td class="num mono">' + (lowN ? '⚠ ' : '') + comparableTotal(s) + '</td>' +
             '<td class="num mono s-pass">' + s.succeeded + '</td>' +
             '<td class="num mono s-fail">' + s.failed + '</td>' +
             '<td class="num mono">' + rate.toFixed(1) + '%</td>' +
@@ -566,6 +628,13 @@ function renderBuildsTable() {
     builds = builds.filter(function(b) {
         if (filt    && b.package.toLowerCase().indexOf(filt) === -1) return false;
         if (statFilt && b.status !== statFilt) return false;
+        if (categoryFilter) {
+            if (categoryFilter === '__unanalyzed__') {
+                if (b.status === 'succeeded' || b.finding_count > 0) return false;
+            } else if (!b.categories || b.categories.indexOf(categoryFilter) === -1) {
+                return false;
+            }
+        }
         return true;
     });
 
@@ -588,15 +657,39 @@ function renderBuildsTable() {
         if (th.dataset.sort === sortColumn) th.classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
     });
 
+    // Result count / active filter line.
+    var rcEl = el('builds-result-count');
+    if (rcEl) {
+        var parts = [builds.length + ' of ' + currentBatchData.builds.length + ' packages'];
+        if (categoryFilter) {
+            var label = categoryFilter === '__unanalyzed__' ? 'Unanalyzed' : categoryFilter;
+            parts.push('<button class="builds-filter-chip" data-action="filter-clear">' +
+                '<span class="builds-filter-chip-label">' + escapeHtml(label) + '</span>' +
+                '<span class="findings-bar-x">×</span></button>');
+        }
+        rcEl.innerHTML = parts.join(' · ');
+    }
+
     var html = '';
     builds.forEach(function(b) {
         var issues = b.finding_count > 0 ? String(b.finding_count)
             : b.status === 'succeeded' ? '<span class="cell-hint" data-hint="No issues detected">0</span>'
             : (b.status === 'failed' || b.status === 'timeout' || b.status === 'dep_wait')
               ? '<span class="cell-hint" data-hint="Build did not complete">n/a</span>' : '-';
-        html += '<tr>' +
+
+        // Row highlight: environmental-only failures get a distinct class.
+        var rowCls = '';
+        if (b.status !== 'succeeded') {
+            rowCls = b.env_only ? 'build-row-env' : 'build-row-fail';
+        }
+
+        // Status cell: environmental-only failures display as "environmental".
+        var stLabel = (b.status !== 'succeeded' && b.env_only) ? 'environmental' : b.status;
+        var stCls = (b.status !== 'succeeded' && b.env_only) ? 'environmental' : b.status;
+
+        html += '<tr class="' + rowCls + '">' +
             '<td><span class="pkg-name">' + escapeHtml(b.package) + '</span></td>' +
-            '<td><span class="st st-' + b.status + '">' + b.status + '</span></td>' +
+            '<td><span class="st st-' + stCls + '">' + stLabel + '</span></td>' +
             '<td class="num mono">' + (b.duration_seconds ? fmtDuration(b.duration_seconds) : '-') + '</td>' +
             '<td class="num mono">' + (b.peak_memory_mb ? b.peak_memory_mb + ' MB' : '-') + '</td>' +
             '<td class="num">' + issues + '</td>' +
@@ -605,7 +698,24 @@ function renderBuildsTable() {
                 '<button class="btn-link" data-action="log" data-id="' + b.id + '" data-pkg="' + escapeAttr(b.package) + '">log</button>' +
             '</td></tr>';
     });
+    if (html === '') {
+        html = '<tr><td colspan="6" class="muted" style="padding:1rem;text-align:center">No packages match the current filters.</td></tr>';
+    }
     tbody.innerHTML = html;
+}
+
+// Set (or toggle off) the Issue-Category filter and re-render.
+function setCategoryFilter(cat) {
+    categoryFilter = (categoryFilter === cat) ? null : cat;
+    renderDetailsFindings();
+    renderBuildsTable();
+}
+
+function clearCategoryFilter() {
+    if (categoryFilter === null) return;
+    categoryFilter = null;
+    renderDetailsFindings();
+    renderBuildsTable();
 }
 
 function handleSort(col) {
@@ -628,7 +738,7 @@ function renderCompareBatchList() {
     batches.forEach(function(b) {
         var label = b.profile_name + ' · ' + b.series;
         if (filter && label.toLowerCase().indexOf(filter) === -1) return;
-        var rate = b.stats.total > 0 ? Math.round(b.stats.succeeded / b.stats.total * 100) : 0;
+        var rate = Math.round(successRate(b.stats));
         var checked = compareSelectedIds.indexOf(b.id) !== -1;
         html += '<li>' +
             '<label class="compare-check-label">' +
@@ -672,20 +782,26 @@ function renderCompareTable() {
             "SELECT source_package, status, build_duration_seconds AS dur, peak_memory_mb AS mem, id " +
             "FROM builds WHERE batch_id = ?", [b.id]
         );
-        // Top category per failing build.
+        // Top category per failing build, plus whether the build's findings are
+        // all environmental (infra artifact, not a toolchain failure).
         var cats = {};
+        var envOnly = {};
         dbQuery(
-            "SELECT b.source_package, bf.category, COUNT(*) as cnt " +
+            "SELECT b.source_package, bf.category, bf.finding_class, COUNT(*) as cnt " +
             "FROM build_findings bf JOIN builds b ON bf.build_id = b.id " +
             "WHERE b.batch_id = ? GROUP BY b.source_package, bf.category",
             [b.id]
         ).forEach(function(r) {
             if (!cats[r.source_package] || r.cnt > cats[r.source_package].cnt)
                 cats[r.source_package] = { category: r.category, cnt: Number(r.cnt) };
+            // Track environmental-only: starts true on first finding, flipped
+            // false if any non-environmental finding appears.
+            if (envOnly[r.source_package] === undefined) envOnly[r.source_package] = true;
+            if (r.finding_class !== 'environmental') envOnly[r.source_package] = false;
         });
         var map = {};
         builds.forEach(function(bld) { map[bld.source_package] = bld; });
-        return { batch: b, map: map, cats: cats };
+        return { batch: b, map: map, cats: cats, envOnly: envOnly };
     });
 
     // Union of all packages across selected batches.
@@ -719,10 +835,14 @@ function renderCompareTable() {
             var bld = d.map[pkg];
             if (!bld) return '<td class="compare-cell compare-cell-missing"><span class="muted">—</span></td>';
             var st = bld.status;
+            var isEnv = st !== 'succeeded' && d.envOnly[pkg];
             var cat = (st !== 'succeeded' && d.cats[pkg]) ? d.cats[pkg].category : null;
-            var cls = st === 'succeeded' ? 'compare-cell-ok' : st === 'failed' ? 'compare-cell-fail' : 'compare-cell-other';
+            var cls = st === 'succeeded' ? 'compare-cell-ok'
+                : isEnv ? 'compare-cell-env'
+                : st === 'failed' ? 'compare-cell-fail' : 'compare-cell-other';
+            var label = isEnv ? 'environmental' : st;
             return '<td class="compare-cell ' + cls + '">' +
-                '<span class="st st-' + st + '">' + st + '</span>' +
+                '<span class="st st-' + (isEnv ? 'environmental' : st) + '">' + label + '</span>' +
                 (cat ? '<br><span class="compare-cat">' + escapeHtml(cat) + '</span>' : '') +
                 '</td>';
         });
@@ -927,6 +1047,8 @@ document.addEventListener('click', function(e) {
     if (action === 'issues')  showBuildDetails(id);
     if (action === 'log') showBuildLog(id, btn.getAttribute('data-pkg'));
     if (action === 'go-details') navigateToDetails(id);
+    if (action === 'filter-category') setCategoryFilter(btn.getAttribute('data-cat'));
+    if (action === 'filter-clear') clearCategoryFilter();
     if (action === 'go-compare') {
         var ids = JSON.parse(btn.getAttribute('data-ids') || '[]');
         navigateToCompare(ids);
@@ -942,7 +1064,7 @@ function closeLogModal() { var m = el('log-modal'); if (m) m.classList.add('hidd
 
 function showBuildDetails(buildId) {
     var findings = dbQuery(
-        "SELECT category, description, excerpt, line_number, severity " +
+        "SELECT category, description, excerpt, line_number, severity, finding_class " +
         "FROM build_findings WHERE build_id = ? ORDER BY severity, line_number",
         [buildId]
     );
@@ -961,8 +1083,11 @@ function showBuildDetails(buildId) {
         var html = '';
         if (errors.length > 0) {
             html += errors.map(function(f) {
-                return '<div class="finding-detail finding-detail-error">' +
-                    '<h4>' + escapeHtml(f.category) + '</h4>' +
+                var envBadge = f.finding_class === 'environmental'
+                    ? ' <span class="finding-class-badge">environmental · excluded from rate</span>' : '';
+                var cls = f.finding_class === 'environmental' ? 'finding-detail-environmental' : 'finding-detail-error';
+                return '<div class="finding-detail ' + cls + '">' +
+                    '<h4>' + escapeHtml(f.category) + envBadge + '</h4>' +
                     '<p>' + escapeHtml(f.description) + '</p>' +
                     (f.line_number ? '<p class="muted">Line ' + f.line_number + '</p>' : '') +
                     (f.excerpt ? '<pre>' + escapeHtml(f.excerpt) + '</pre>' : '') +
@@ -1111,6 +1236,20 @@ function rateColorClass(rate) {
     if (rate >= 50) return 'rate-yellow';
     if (rate >= 20) return 'rate-orange';
     return 'rate-red';
+}
+
+// Denominator for a fair compiler comparison: total builds minus environmental-
+// only failures (infra artifacts that aren't a toolchain result).
+function comparableTotal(s) {
+    return Math.max(0, (s.total || 0) - (s.environmental || 0));
+}
+
+// Toolchain success rate (0–100): succeeded / comparable total. Excludes
+// environmental-only failures from the denominator so infra flakiness doesn't
+// drag down a compiler's score.
+function successRate(s) {
+    var denom = comparableTotal(s);
+    return denom > 0 ? (s.succeeded / denom) * 100 : 0;
 }
 
 function fmtDuration(s) {
